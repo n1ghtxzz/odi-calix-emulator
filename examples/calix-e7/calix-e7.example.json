@@ -1,0 +1,25 @@
+{
+  "schema": 1,
+  "ethernet_ports": 4,
+  "management_ip": null,
+  "identity": {
+    "GPON_SN": null,
+    "GPON_ONU_MODEL": null,
+    "ONU_HW_VERSION": null,
+    "OMCI_SW_VER1": null,
+    "OMCI_SW_VER2": null,
+    "OMCC_VER": null,
+    "OMCI_VENDOR_PRODUCT_CODE": null
+  },
+  "compatibility": {
+    "OMCI_PRIVATE_ME": "0",
+    "OMCI_UNKNOWN_ME_OK": "1",
+    "OMCI_POTS_PORTS": "2",
+    "OMCI_POTS_SLOT_ID": "2",
+    "OMCI_VEIP": "1",
+    "OMCI_VEIP_SLOT_ID": "3",
+    "OMCI_CUSTOM_ME": "256"
+  },
+  "reported_mfg_serial": null,
+  "reported_ip_host_macs": {}
+}

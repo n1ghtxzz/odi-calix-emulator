@@ -1,0 +1,32 @@
+name: Add Calix profile template to v1.0.0
+
+on:
+  push:
+    branches: ['release-profile/v1.0.0']
+    paths:
+      - '.github/workflows/add-calix-template.yml'
+      - 'examples/calix-e7/**'
+      - 'docs/CALIX-PROFILE.*.md'
+      - 'tools/prepare-calix-profile.py'
+      - 'tools/release-calix-template.py'
+      - 'test/calix_profile_template_test.py'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: calix-profile-assets-v1.0.0
+  cancel-in-progress: false
+
+jobs:
+  append-template:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate generator and actual seed writer with isolated fixtures
+        run: python3 -m unittest discover -s test -p calix_profile_template_test.py -v
+      - name: Package and append assets without changing the firmware
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 tools/release-calix-template.py --output out/calix-profile --publish

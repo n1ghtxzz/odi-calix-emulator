@@ -5,6 +5,8 @@ listed here.
 
 ## Unreleased
 
+- Add a blank Calix/E7 profile template, validated offline seed/OME1 generator, RU/EN setup guides and an append-only v1.0.0 release asset job. Existing subscriber values are omitted unless explicitly supplied; the firmware image is unchanged.
+
 ## v1.0.0 — 2026-11-06
 
 - First Calix/E7 compatibility release: the preserved R6 service implementation and R8.1 web UI.

@@ -22,6 +22,7 @@ interface. Unfinished hardware DSCP changes are excluded.
 | MIB browser | firmware-specific views | 106 classes, including ten Calix/E7 models; numeric reads and hex entity IDs |
 | Web language | firmware-specific | RU/EN selector, 1762 reviewed dictionary entries; all ten confirmation sites exercised in 30 cases and all five HTML dialogs checked |
 | Diagnostic data | firmware-specific formatting | logs, severity levels, raw dumps, MIB attribute identifiers and provider SIP values remain untranslated |
+| Profile setup | model-specific | Public Calix/E7 example, offline private-profile generator and Russian/English guides; no subscriber identity or passwords |
 | Hardware DSCP | model-specific | hardware command 52 remains unsupported; wire-level DSCP priority support is not claimed |
 
 The SFP has one physical Ethernet interface. Emulated LAN/POTS/VEIP instances
@@ -61,3 +62,10 @@ only. Checksums and verification manifests accompany the image.
 Nothing flashes or commits a device automatically. Follow
 [docs/FLASHING.md](docs/FLASHING.md) for an inactive-slot trial and manual
 commit. See [localization/README.md](localization/README.md) to edit translations.
+
+## Calix profile template
+
+See [the English guide](docs/CALIX-PROFILE.en.md) or [Russian guide](docs/CALIX-PROFILE.ru.md).
+The v1.0.0 release includes a blank template and an offline generator. Null identity
+fields preserve existing values; no line credentials are shipped. Prepared private
+profiles belong outside Git. The generator never contacts or flashes a device.
