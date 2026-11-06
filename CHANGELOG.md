@@ -5,6 +5,8 @@ listed here.
 
 ## Unreleased
 
+- Publish the prepared generic v1.0.0 image, checksums, SBOM and bilingual installation notes through a bounded GitHub Actions release job; subscriber profiles and owner credentials stay excluded.
+
 ## v1.0.0 — 2026-11-06
 
 - First Calix/E7 compatibility release: the preserved R6 service implementation and R8.1 web UI.

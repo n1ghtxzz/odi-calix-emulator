@@ -1,0 +1,60 @@
+name: Publish prepared v1.0.0
+
+on:
+  push:
+    branches: ['release-publish/v1.0.0']
+    paths:
+      - '.github/workflows/publish-prepared.yml'
+      - 'releases/v1.0.0/**'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-prepared-v1.0.0
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      SOURCE_COMMIT: 26dcea2907052b756b554a1d9c0062bd6869fd08
+      TAG_OBJECT: bc8e38655d90835f54cbf5c991afb599a01581fe
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify prepared assets and signed source tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd releases/v1.0.0 && sha256sum --check SHA256SUMS)
+          python3 releases/v1.0.0/verify.py
+          git config gpg.format ssh
+          git config gpg.ssh.allowedSignersFile "$PWD/releases/v1.0.0/allowed-signers"
+          actual=$(git mktag < releases/v1.0.0/v1.0.0.tag)
+          test "$actual" = "$TAG_OBJECT"
+          git update-ref refs/tags/v1.0.0 "$actual"
+          git verify-tag v1.0.0
+          test "$(git rev-parse 'v1.0.0^{}')" = "$SOURCE_COMMIT"
+
+      - name: Publish source tag and release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view v1.0.0 --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo 'Release already exists; refusing to replace it.' >&2
+            exit 1
+          fi
+          git push origin refs/tags/v1.0.0
+          gh release create v1.0.0 --repo "$GITHUB_REPOSITORY" --verify-tag \
+            --title 'ODI Calix Emulator v1.0.0' \
+            --notes-file releases/v1.0.0/NOTES.md \
+            releases/v1.0.0/odi-calix-v1.0.0.tar \
+            releases/v1.0.0/SHA256SUMS \
+            releases/v1.0.0/image-verification.json \
+            releases/v1.0.0/sbom.cdx.json \
+            releases/v1.0.0/INSTALL.md

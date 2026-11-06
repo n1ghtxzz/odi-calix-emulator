@@ -1,0 +1,29 @@
+{
+  "version": "v1.0.0",
+  "source_commit": "26dcea2907052b756b554a1d9c0062bd6869fd08",
+  "image_bytes": 2785280,
+  "image_sha256": "485169aafa8c2830faf1892e5c060a98c671706c125f6aa30e6cf1270928eebf",
+  "root_password_locked": true,
+  "owner_profile_included": false,
+  "owner_credentials_included": false,
+  "web_assets_match_source": true,
+  "service_binaries_match_verified_r8_1": true,
+  "kernel_matches_verified_r8_1": true,
+  "hardware_tested": false,
+  "agent_flashed_device": false,
+  "assembly": "Clean public skeleton and UI; verified kernel and executable inputs reused",
+  "binary_sha256": {
+    "bin/diag": "1a81a51becce06351fbc0a2f52ee9d96e5613efdd269623bde1a8def1ec4f59d",
+    "bin/omcid": "e0dc6c168682d85bcc4a413e6446afc71c5d76196ba7664fe38f508fdbed7807",
+    "bin/omcli": "c5051d3c75e8562dbfc882e4eaa96b03f2ee4bbffecef619f095f2056244f11c",
+    "bin/omciprobe": "9d86dc75678a62f71e2d7f8772d13c0b0c7ddf8c4521f7007d0598fa0f3d98dd",
+    "bin/omcicap": "ac017e8acb317403a6f9ab1f926a4be9010a08cd58c65706664e8df57e445927",
+    "bin/nv": "9a134ac0d4f9a29bd90a332f524cb7a1816c34722f3300f0b5939552afb8f4a7",
+    "bin/igmpd": "f3a6f95df75f52ca103845d3db11e189e77bae07ae1a158073eccee6a9e9bc54",
+    "bin/metricsd": "667e560314a41755d0ea993c923130f64c2f38379bb978e90b8d94258a760dd7",
+    "bin/confd": "2e86fb91be725c8d69f94430f03abcd63ec94955d79d638fcffbfd078f1356dc",
+    "sbin/dropbearmulti": "b52e62422f11b26b7acdc66f7d78b4a580e3832041f849f6ca39afad91939887",
+    "sbin/ip": "004de181cf8265eeda249badb2dc236028fb13aac139e50b4f2a6b70fd81fa5c",
+    "sbin/bridge": "631323fbf574ef9b90de616c5d15b4b8421227438e03d71a27b44ac03b9c0595"
+  }
+}
