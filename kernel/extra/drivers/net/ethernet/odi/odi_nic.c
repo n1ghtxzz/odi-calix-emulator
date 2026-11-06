@@ -1,0 +1,1740 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * odi_nic.c -- the RTL9602C CPU-port Ethernet NIC: one RX ring (and, with
+ * odi_nic.omci_ring, a second one the switch routes OMCI to) and one TX ring
+ * behind five net_devices, plus two entry points for odi_omci.c
+ * (odi_nic.h): an RX hook, so OMCI frames reach omcid without a
+ * net_device of their own, and a TX call with caller-filled descriptor
+ * words.
+ *
+ * Scope: a bridge ONU with management on br0. No multi-WAN, no bridge
+ * shortcut (the kernel bridge does it), no external switch, no hardware
+ * LSO, no descriptors in SRAM.
+ */
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/netdevice.h>
+#include <linux/etherdevice.h>
+#include <linux/interrupt.h>
+#include <linux/dma-mapping.h>
+#include <linux/delay.h>
+#include <linux/io.h>
+#include <asm/addrspace.h> /* CPHYSADDR() */
+#include <asm/mach-rtl8686/rtl8686-barrier.h>
+#include <linux/ethtool.h>
+#include <linux/if_ether.h>
+#include <linux/platform_device.h>
+#include <linux/atomic.h>
+#include <linux/jiffies.h>
+#include <linux/workqueue.h>
+#include <linux/reboot.h>
+#include <linux/notifier.h>
+#include <linux/panic_notifier.h>
+#include <linux/unaligned.h>
+#include <linux/proc_fs.h>
+#include <linux/seq_file.h>
+#include <linux/rtnetlink.h>
+#include <asm/mach-rtl8686/irq.h>
+#include <asm/mach-rtl8686/rtl8686regs.h>
+
+#include "odi_nic_hw.h"
+#include "odi_nic.h"
+#include "odi_wdt.h" /* wdt_pre_reset_hook */
+
+/* The NIC interrupt as a Linux irq: board source 26 plus the irqchip base. */
+#define ODI_NIC_IRQ_NUM		RTL8686_VIRQ(RTL8686_IRQ_GMAC)
+
+#define DRV_NAME "odi_nic"
+
+/* Development tracing, off by default: the first interrupts and RX
+ * descriptors, the ring register read-backs at open, and a state dump
+ * 15 s and 45 s after the first open (odi_state_dump_work()). The storm
+ * guard in odi_irq() stays on regardless.
+ */
+static bool odi_nic_debug;
+module_param_named(debug, odi_nic_debug, bool, 0644);
+MODULE_PARM_DESC(debug, "trace the first interrupts and RX descriptors, dump the NIC state after open (default off)");
+
+/* odi_nic.omci_ring: run the second RX ring and route the OMCI frames to
+ * it, or (the default) run ring 1 alone, with the same register values as
+ * before the OMCI ring existed. Both rings are allocated and served either
+ * way; the parameter switches multi-ring RX on or off, at once when a
+ * device is open (odi_nic_omci_ring_set(), odi_rx_multi_apply()).
+ */
+static bool odi_nic_omci_ring;
+
+/* ---- MMIO access -------------------------------------------------------
+ *
+ * The registers are not all 32 bits wide, so every access names its width.
+ */
+static void __iomem *odi_mmio;
+
+static inline u32 odi_r32(u32 off) { return readl(odi_mmio + off); }
+static inline void odi_w32(u32 off, u32 val) { writel(val, odi_mmio + off); }
+static inline u16 odi_r16(u32 off) { return readw(odi_mmio + off); }
+static inline void odi_w16(u32 off, u16 val) { writew(val, odi_mmio + off); }
+static inline u8 odi_r8(u32 off) { return readb(odi_mmio + off); }
+static inline void odi_w8(u32 off, u8 val) { writeb(val, odi_mmio + off); }
+
+/* Descriptor stores the DMA engine must see before the next store: the
+ * body of a descriptor before its ownership bit, and every returned
+ * ownership bit before the engine is stopped. A sync, which drains the
+ * write buffer. Not wmb(): the kernel is built as CPU_R3000, where
+ * wmb() emits no instruction (rtl8686-barrier.h).
+ */
+#define odi_dma_wmb()	rtl8686_sync()
+
+/* ---- Net devices and switch-port mapping -------------------------------
+ *
+ * RX frames are handed to the device that claims their source port.
+ * eth0.2 is the host port: LAN traffic arrives there
+ * (docs/kb/rtl9601-multi-lan-eth0-2-is-the-host-port.md). eth0 is the
+ * catch-all for anything else. nas0 and pon0 exist because the rootfs
+ * scripts name them; no traffic reaches them through this driver.
+ */
+#define ODI_PORT_CATCHALL	ODI_NIC_DEV_PORT_CATCHALL	/* eth0: never matched by src_port_num */
+#define ODI_PORT_LAN0		ODI_NIC_DEV_PORT_LAN0		/* eth0.2 */
+#define ODI_PORT_LAN1		ODI_NIC_DEV_PORT_LAN1		/* eth0.3 */
+#define ODI_PORT_NONE		ODI_NIC_DEV_PORT_NONE		/* nas0, pon0: no traffic reaches these here */
+
+#define ODI_NUM_DEVS 5
+
+struct odi_port {
+	struct net_device *dev;
+	unsigned int port;		/* ODI_PORT_* -- which src_port_num this device claims */
+};
+
+/* ---- Shared NIC state: one ring set behind all five net_devices -------
+ *
+ * Two RX rings, the second in use only with odi_nic.omci_ring on
+ * (multi-ring RX). ODI_RXR_DATA is ring 1, which takes every frame of
+ * internal priority 0 to 6 (all of them with one ring): the host side, the
+ * management traffic, ARP. ODI_RXR_OMCI is the ring the switch then routes
+ * priority 7 to, the priority
+ * of the OMCI frames it traps (odi_nic_hw.h, ODI_NIC_OMCI_PRIO), so a
+ * flood from the host side that keeps ring 1 full cannot take the
+ * descriptors OMCI needs: with one ring, another open implementation's
+ * measurements on this chip lost 8 of 440 OMCI messages of a registration
+ * under a host flood, and none of 442 with the second ring. Every poll
+ * serves the OMCI ring first. Both rings go through the same frame path
+ * (odi_rx_ring()), so the PON-port drop and the RX hooks apply alike.
+ */
+enum { ODI_RXR_DATA, ODI_RXR_OMCI, ODI_RXR_NUM };
+
+struct odi_rxr {
+	struct odi_rx_desc *desc;
+	dma_addr_t dma;
+	struct sk_buff **skb;
+	unsigned int depth;
+	unsigned int head;	/* next descriptor to inspect */
+	u32 taken;		/* descriptors taken back from this ring */
+};
+
+static const unsigned int odi_rxr_depth[ODI_RXR_NUM] = {
+	[ODI_RXR_DATA] = ODI_RX_RING_DEPTH,
+	[ODI_RXR_OMCI] = ODI_RX2_RING_DEPTH,
+};
+
+struct odi_nic {
+	struct odi_rxr rx[ODI_RXR_NUM];
+
+	struct odi_tx_desc *tx_ring;
+	dma_addr_t tx_ring_dma;
+	/* Per-slot TX bounce buffers (callers hand raw payloads, copied into
+	 * a buffer we own), with the mapping odi_tx_reclaim() unmaps.
+	 */
+	void **tx_buf;
+	dma_addr_t *tx_dma;
+	unsigned int *tx_len;
+
+	unsigned int tx_tail;	/* next descriptor to fill */
+	unsigned int tx_reclaim;	/* next descriptor to reclaim */
+
+	struct napi_struct napi;
+	struct net_device *napi_dev;	/* NAPI is device-scoped; any of ours will do */
+	spinlock_t lock;
+
+	struct odi_port ports[ODI_NUM_DEVS];
+	int irq_requested;
+
+	/* Interrupt-storm guard (odi_nic_hw.h, odi_irq_storm_note()): more
+	 * than ODI_IRQ_STORM_TRIP_COUNT interrupts that do no work within
+	 * ODI_IRQ_STORM_WINDOW_MS mask the NIC and disable the line. A masked,
+	 * limping boot beats a silent livelock; odi_wdt resets a NIC left
+	 * that way (the CPU-port RX rule, docs/SETTINGS.md).
+	 */
+	struct odi_irq_storm irq_storm;
+	int irq_storm_tripped;
+
+	/* The development state dump, after the first open only
+	 * (odi_nic.debug).
+	 */
+	struct delayed_work state_dump_work;
+	int state_dump_fire;		/* 0 before first firing, 1 after it */
+
+	/* TX reclaim runs from NAPI (RX and the TX-completion interrupt) and
+	 * from ndo_start_xmit. Two safety nets cover an interrupt that does
+	 * not come, so a missing TOK is the old polled behaviour and never a
+	 * TX stall: tx_stall_work, while the queues are stopped (a stopped
+	 * queue no longer calls ndo_start_xmit, and with no RX traffic nothing
+	 * else would wake it), and tx_backstop_work, armed by every frame
+	 * queued and re-armed while descriptors remain in flight.
+	 */
+	struct delayed_work tx_stall_work;
+	struct delayed_work tx_backstop_work;
+
+	/* Diagnostic counters (/proc/odi_nic, the dump, the pre-reset line),
+	 * read without locking.
+	 */
+	unsigned int irq_entries;
+	unsigned int napi_polls;
+	unsigned int tok_irqs;		/* entries with the TX-completion bit set */
+	unsigned int tok_work;		/* ... of which scheduled a reclaim */
+	unsigned int tok_idle;		/* ... of which found nothing to reclaim */
+	unsigned int tx_queued;		/* frames queued, under odi.lock */
+	u32 tok_seen_queued;		/* tx_queued at the last idle TOK, irq context only */
+	unsigned int backstop_reclaims;	/* work runs that freed descriptors the interrupt had not */
+
+	/* RX descriptors the poll has taken back from the hardware, frames
+	 * and drops alike: odi_wdt's measure of RX progress. Never reset, so
+	 * a reader only ever looks at the difference.
+	 */
+	u32 rx_taken;
+
+	/* Frames from the PON port (/proc/odi_nic): every one handed to the
+	 * RX hooks, OMCI included, and the ones no hook took, dropped before
+	 * a net_device. rx_pon_dropped stays 0 while the switch keeps the
+	 * fibre away from the CPU port.
+	 */
+	u32 rx_pon;
+	u32 rx_pon_dropped;
+	u32 rx_split_dropped;
+
+	/* The parking ring for RX rings 3 to 6 (odi_nic_hw.h, "Multi-ring
+	 * RX"): two descriptors the CPU owns, and a buffer they point at so
+	 * that even a stray engine write lands in memory of ours.
+	 */
+	struct odi_rx_desc *park;
+	dma_addr_t park_dma;
+
+	/* rx2_routed: multi-ring RX is on and priority 7 goes to the OMCI
+	 * ring (odi_nic.omci_ring, odi_rx_multi_apply()). rx2_other counts
+	 * frames on it that are not OMCI (a host frame that arrived with
+	 * priority 7), which take its descriptors too.
+	 */
+	int rx2_routed;
+	u32 rx2_other;
+
+	/* RX_NO_DESC_CNT folded in at every poll: frames the engine dropped
+	 * with no free descriptor, on either ring.
+	 */
+	u32 rx_missed;
+	u16 rx_missed_last;
+};
+
+static struct odi_nic odi;
+
+/* A platform device only so the DMA API has a struct device with a DMA
+ * mask: the MIPS dma-mapping code dereferences dev->coherent_dma_mask, and
+ * a NULL device hangs the first ndo_open silently.
+ */
+static struct platform_device *odi_pdev;
+
+/* ---- RX classification hooks: odi_nic_rxhook_register -----------------
+ *
+ * odi_omci.c registers here instead of opening its own net_device.
+ */
+
+#define ODI_MAX_RXHOOKS 8
+
+struct odi_rxhook {
+	int used;
+	int portmask;
+	int priority;
+	odi_rxhook_fn fn;
+};
+
+static struct odi_rxhook odi_rxhooks[ODI_MAX_RXHOOKS];
+static DEFINE_SPINLOCK(odi_rxhook_lock);
+
+/* Returns 0, or -1 when the table is full. */
+int odi_nic_rxhook_register(int portmask, int priority, odi_rxhook_fn rx)
+{
+	unsigned long flags;
+	int i;
+
+	spin_lock_irqsave(&odi_rxhook_lock, flags);
+	for (i = 0; i < ODI_MAX_RXHOOKS; i++) {
+		if (!odi_rxhooks[i].used) {
+			odi_rxhooks[i].used = 1;
+			odi_rxhooks[i].portmask = portmask;
+			odi_rxhooks[i].priority = priority;
+			odi_rxhooks[i].fn = rx;
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&odi_rxhook_lock, flags);
+	if (i == ODI_MAX_RXHOOKS) {
+		pr_warn(DRV_NAME ": rxhook table full, portmask 0x%x priority %d dropped\n",
+			portmask, priority);
+		return -1;
+	}
+	pr_info(DRV_NAME ": rxhook portmask 0x%x priority %d registered\n", portmask, priority);
+	return 0;
+}
+
+/* Walk the matching hooks from the highest priority down, until one
+ * consumes the frame. Returns nonzero when the frame
+ * was consumed (and freed, or taken over), 0 when the caller should
+ * deliver it to the net device.
+ */
+static int odi_dispatch_rxhooks(const struct odi_rx_desc *d, unsigned int src_port,
+				struct sk_buff *skb)
+{
+	struct odi_rx_words info = { d->opts1, d->addr, d->opts2, d->opts3 };
+	int done_prio = INT_MAX;
+
+	for (;;) {
+		struct odi_rxhook *best = NULL;
+		unsigned long flags;
+		odi_rxhook_fn fn;
+		int i, ret;
+
+		spin_lock_irqsave(&odi_rxhook_lock, flags);
+		for (i = 0; i < ODI_MAX_RXHOOKS; i++) {
+			if (!odi_rxhooks[i].used)
+				continue;
+			if (!(odi_rxhooks[i].portmask & (1 << src_port)))
+				continue;
+			if (odi_rxhooks[i].priority >= done_prio)
+				continue;
+			if (!best || odi_rxhooks[i].priority > best->priority)
+				best = &odi_rxhooks[i];
+		}
+		fn = best ? best->fn : NULL;
+		if (best)
+			done_prio = best->priority;
+		spin_unlock_irqrestore(&odi_rxhook_lock, flags);
+
+		if (!fn)
+			return 0;
+		ret = fn(skb, &info);
+		if (ret == ODI_RXHOOK_STOP) {
+			dev_kfree_skb(skb);
+			return 1;
+		}
+		if (ret == ODI_RXHOOK_STOP_NOFREE)
+			return 1;
+	}
+}
+
+/* ---- TX with caller-filled descriptor words ---------------------------
+ *
+ * odi_omci.c sends OMCI replies with an explicit destination port and GEM
+ * stream, not through ndo_start_xmit. struct odi_tx_words is the
+ * descriptor itself (odi_nic.h): the port mask is in opts3, not opts1.
+ */
+/* opts1 bits the caller may set; own, eor, fs, ls and the length are ours. */
+#define ODI_TXINFO_OPTS1_KEEP	(ODI_TXD_IP_CSUM | ODI_TXD_L4_CSUM | ODI_TXD_BIT25 | (1U << 24) | \
+				 ODI_TXD_ADD_CRC | ODI_TXD_BIT22 | ODI_TXD_NO_LEARN | (7U << 18))
+
+static int odi_nic_xmit_desc(unsigned int port_mask, unsigned int prio, int dislrn,
+			      const void *data, unsigned int len);
+static int odi_nic_xmit_raw(u32 opts1, u32 opts2, u32 opts3,
+			     const void *data, unsigned int len);
+
+/* A raw frame, its length, and the descriptor words the caller filled. */
+int odi_nic_tx_words(const void *frame, unsigned short len, const struct odi_tx_words *tx)
+{
+	if (!frame || !tx)
+		return -1;
+	if (len > ODI_NIC_RX_BUF_SIZE)
+		len = ODI_NIC_RX_BUF_SIZE;
+	return odi_nic_xmit_raw(tx->opts1 & ODI_TXINFO_OPTS1_KEEP, tx->opts2, tx->opts3,
+				frame, len);
+}
+
+/* ---- Ring setup --------------------------------------------------------
+ *
+ * dma_alloc_coherent gets the uncached mapping and the physical address
+ * atomically, with no manual KSEG1 aliasing or cache writeback.
+ */
+/* One RX ring, every descriptor handed to the hardware with a mapped
+ * buffer. The base must be ODI_DESC_ALIGN-aligned, or the engine and the
+ * driver disagree about the ring without any error.
+ */
+static int odi_rxr_alloc(struct device *dev, struct odi_rxr *r, unsigned int depth)
+{
+	unsigned int i;
+
+	r->depth = depth;
+	r->head = 0;
+	r->desc = dma_alloc_coherent(dev, sizeof(*r->desc) * depth, &r->dma, GFP_KERNEL);
+	r->skb = kcalloc(depth, sizeof(*r->skb), GFP_KERNEL);
+	if (!r->desc || !r->skb)
+		return -ENOMEM;
+	if (!odi_desc_aligned(r->desc, (u32)r->dma)) {
+		pr_err(DRV_NAME ": rx ring base not %u-byte aligned (virt %p dma 0x%08x)\n",
+		       ODI_DESC_ALIGN, r->desc, (u32)r->dma);
+		return -EFAULT;
+	}
+
+	for (i = 0; i < depth; i++) {
+		struct sk_buff *skb = dev_alloc_skb(ODI_NIC_RX_ALLOC);
+		dma_addr_t dma;
+
+		if (!skb)
+			return -ENOMEM;
+		dma = dma_map_single(dev, skb->data, ODI_NIC_RX_ALLOC, DMA_FROM_DEVICE);
+		if (dma_mapping_error(dev, dma)) {
+			dev_kfree_skb(skb);
+			return -ENOMEM;
+		}
+		r->skb[i] = skb;
+		r->desc[i].addr = (u32)dma;
+		r->desc[i].opts1 = ODI_RXD_HANDOFF((i == depth - 1) ? ODI_RXD_WRAP : 0);
+		r->desc[i].opts2 = 0;
+		r->desc[i].opts3 = 0;
+	}
+	return 0;
+}
+
+static int odi_rings_alloc(struct device *dev)
+{
+	size_t tx_sz = sizeof(struct odi_tx_desc) * ODI_TX_RING_DEPTH;
+	unsigned int i;
+	int ret;
+
+	for (i = 0; i < ODI_RXR_NUM; i++) {
+		ret = odi_rxr_alloc(dev, &odi.rx[i], odi_rxr_depth[i]);
+		if (ret)
+			return ret;
+	}
+
+	/* The parking ring and its buffer, one coherent page: the
+	 * descriptors zeroed (CPU-owned, so the engine never writes them),
+	 * the last one marked as the end of the ring.
+	 */
+	odi.park = dma_alloc_coherent(dev, ODI_NIC_PARK_ALLOC, &odi.park_dma, GFP_KERNEL);
+	if (!odi.park)
+		return -ENOMEM;
+	if (!odi_desc_aligned(odi.park, (u32)odi.park_dma)) {
+		pr_err(DRV_NAME ": parking ring not %u-byte aligned (virt %p dma 0x%08x)\n",
+		       ODI_DESC_ALIGN, odi.park, (u32)odi.park_dma);
+		return -EFAULT;
+	}
+	for (i = 0; i < ODI_NIC_RX_PARK_DEPTH; i++) {
+		odi.park[i].addr = (u32)odi.park_dma + ODI_NIC_PARK_BUF_OFF;
+		odi.park[i].opts1 = (i == ODI_NIC_RX_PARK_DEPTH - 1) ? ODI_RXD_WRAP : 0;
+		odi.park[i].opts2 = 0;
+		odi.park[i].opts3 = 0;
+	}
+
+	odi.tx_ring = dma_alloc_coherent(dev, tx_sz, &odi.tx_ring_dma, GFP_KERNEL);
+	odi.tx_buf = kcalloc(ODI_TX_RING_DEPTH, sizeof(*odi.tx_buf), GFP_KERNEL);
+	odi.tx_dma = kcalloc(ODI_TX_RING_DEPTH, sizeof(*odi.tx_dma), GFP_KERNEL);
+	odi.tx_len = kcalloc(ODI_TX_RING_DEPTH, sizeof(*odi.tx_len), GFP_KERNEL);
+	if (!odi.tx_ring || !odi.tx_buf || !odi.tx_dma || !odi.tx_len)
+		return -ENOMEM;
+
+	if (!odi_desc_aligned(odi.tx_ring, (u32)odi.tx_ring_dma)) {
+		pr_err(DRV_NAME ": tx ring base not %u-byte aligned (virt %p dma 0x%08x)\n",
+		       ODI_DESC_ALIGN, odi.tx_ring, (u32)odi.tx_ring_dma);
+		return -EFAULT;
+	}
+
+	for (i = 0; i < ODI_TX_RING_DEPTH; i++) {
+		odi.tx_ring[i].opts1 = (i == ODI_TX_RING_DEPTH - 1) ? ODI_TXD_WRAP : 0;
+	}
+
+	/* The hardware starts ring 1 and the TX ring at index 0 after
+	 * odi_reset_hw(), so a reopen after the last close starts ours there
+	 * too. The OMCI ring starts where its engine index is, once
+	 * multi-ring RX is turned on (odi_rx_multi_apply()).
+	 */
+	odi.tx_tail = 0;
+	odi.tx_reclaim = 0;
+
+	return 0;
+}
+
+/* Every non-NULL skb slot is a buffer the ring owns and that is still
+ * mapped at desc[i].addr: odi_rxr_alloc() fills a slot only once its
+ * mapping succeeded, and odi_rx_ring() swaps a slot only for a replacement
+ * that is already mapped. A slot is filled only when desc was allocated.
+ */
+static void odi_rxr_free(struct device *dev, struct odi_rxr *r)
+{
+	unsigned int i;
+
+	if (r->skb) {
+		for (i = 0; i < r->depth; i++) {
+			if (!r->skb[i])
+				continue;
+			dma_unmap_single(dev, r->desc[i].addr,
+					 ODI_NIC_RX_ALLOC, DMA_FROM_DEVICE);
+			dev_kfree_skb(r->skb[i]);
+		}
+		kfree(r->skb);
+		r->skb = NULL;
+	}
+	if (r->desc)
+		dma_free_coherent(dev, sizeof(*r->desc) * r->depth, r->desc, r->dma);
+	r->desc = NULL;
+}
+
+static void odi_rings_free(struct device *dev)
+{
+	unsigned int i;
+
+	for (i = 0; i < ODI_RXR_NUM; i++)
+		odi_rxr_free(dev, &odi.rx[i]);
+	if (odi.park)
+		dma_free_coherent(dev, ODI_NIC_PARK_ALLOC, odi.park, odi.park_dma);
+	odi.park = NULL;
+	if (odi.tx_buf) {
+		for (i = 0; i < ODI_TX_RING_DEPTH; i++) {
+			if (!odi.tx_buf[i])
+				continue;
+			dma_unmap_single(dev, odi.tx_dma[i], odi.tx_len[i], DMA_TO_DEVICE);
+			kfree(odi.tx_buf[i]);
+		}
+		kfree(odi.tx_buf);
+		odi.tx_buf = NULL;
+	}
+	kfree(odi.tx_dma);
+	odi.tx_dma = NULL;
+	kfree(odi.tx_len);
+	odi.tx_len = NULL;
+	if (odi.tx_ring)
+		dma_free_coherent(dev, sizeof(struct odi_tx_desc) * ODI_TX_RING_DEPTH,
+				   odi.tx_ring, odi.tx_ring_dma);
+	odi.tx_ring = NULL;
+}
+
+/* ---- Hardware init, in the required order ------------------------------ */
+
+/* A clock-gate cycle of the NIC block, not a register soft reset.
+ * ODI_SOC_BLOCK_EN is defined as its KSEG1 alias; ioremap() takes the
+ * physical address (a KSEG1 value maps a page that does not exist, and the
+ * first readl hangs with no exception).
+ */
+static void odi_reset_hw(void)
+{
+	void __iomem *blk = ioremap(CPHYSADDR(ODI_SOC_BLOCK_EN), 4);
+
+	if (!blk) {
+		pr_warn(DRV_NAME ": could not map the block-enable register, skipping the clock-gate cycle\n");
+		return;
+	}
+	writel(readl(blk) & ~ODI_SOC_BLOCK_EN_NIC, blk);
+	mdelay(10);
+	writel(readl(blk) | ODI_SOC_BLOCK_EN_NIC, blk);
+	iounmap(blk);
+}
+
+/* RX checksum and jumbo, every interrupt source acked, TX config and the
+ * CPU tag engine.
+ */
+static void odi_init_hw_mac(void)
+{
+	odi_w8(ODI_NIC_CTRL + 3 /* CTRL is the byte at offset 0x3B of the 0x38 word */,
+	       ODI_NIC_CTRL_RX_CSUM | ODI_NIC_CTRL_RX_JUMBO);
+
+	odi_w16(ODI_NIC_IRQ_STATUS, ODI_NIC_IRQ_ALL);
+	odi_w32(ODI_NIC_RING_IRQ_STATUS, 0xFFFFFFFFU);
+
+	/* RING_IRQ_MASK/RING_IRQ_STATUS are the separate sources of RX rings
+	 * 2-6, used only with FIFO_CFG RING_IRQS set. With it clear, ring 1
+	 * and the OMCI ring both interrupt through IRQ_MASK/IRQ_STATUS
+	 * (IRQ_RX_OK), which is all odi_irq() reads and acks. Unmasking here
+	 * (or setting RING_IRQS) could route a ring through a status odi_irq()
+	 * never acks: an interrupt that re-asserts forever.
+	 */
+	odi_w32(ODI_NIC_RING_IRQ_MASK, 0x0U);
+
+	odi_w32(ODI_NIC_TX_CFG, ODI_NIC_TX_CFG_VAL);
+
+	/* The CPU tag engine off, then on with the full profile: written once
+	 * with the final value, it stays in a stale state.
+	 */
+	odi_w32(ODI_NIC_TAG_CTRL, 0);
+	odi_w32(ODI_NIC_TAG_CTRL, ODI_NIC_TAG_CTRL_ON);
+
+	/* VDSL and PON port fields: 0. The LAN and management path does not
+	 * use them, and their switch-side port numbers are not documented.
+	 */
+	odi_w32(ODI_NIC_TAG_CTRL1, ODI_NIC_TAG1_VAL(0, 0, ODI_NIC_TAG1_SID0));
+}
+
+/* The ring bases, the RX ring depth and count, flow control and pause. */
+static void odi_init_hw_rings(void)
+{
+	struct odi_rxr *r1 = &odi.rx[ODI_RXR_DATA], *r2 = &odi.rx[ODI_RXR_OMCI];
+
+	pr_info(DRV_NAME ": tx ring phys 0x%08x (%u entries), rx ring phys 0x%08x (%u entries), omci ring phys 0x%08x (%u entries)\n",
+		(u32)odi.tx_ring_dma, ODI_TX_RING_DEPTH, (u32)r1->dma, r1->depth,
+		(u32)r2->dma, r2->depth);
+
+	odi_w32(ODI_NIC_TX1_RING, (u32)odi.tx_ring_dma);
+	odi_w32(ODI_NIC_TX1_INDEX, 0);
+	if (odi_nic_debug)
+		pr_info(DRV_NAME ": tx1_ring wrote 0x%08x read back 0x%08x, tx1_index read back 0x%08x\n",
+			(u32)odi.tx_ring_dma, odi_r32(ODI_NIC_TX1_RING), odi_r32(ODI_NIC_TX1_INDEX));
+
+	odi_w32(ODI_NIC_RX1_RING, (u32)r1->dma);
+	r1->head = 0;
+
+	/* RX1_LAST is the depth minus one, 12 bits split low byte / high
+	 * nibble; RX1_CPU_IDX and the two thresholds are single bytes of one
+	 * word (odi_nic_hw.h), and a wider write clobbers its neighbours.
+	 * Every one of them fits its low byte (the BUILD_BUG_ONs in
+	 * odi_nic_init()), so no high nibble is written.
+	 */
+	odi_w8(ODI_NIC_RX1_LAST, (u8)((ODI_RX_RING_DEPTH - 1) & 0xFF));
+	odi_w8(ODI_NIC_RX1_LAST_HI, (u8)(((ODI_RX_RING_DEPTH - 1) >> 8) & 0x0F));
+
+	/* Flow control: every descriptor starts out handed to the hardware,
+	 * and odi_rx_cpu_idx_update() moves the index along from here.
+	 */
+	odi_w8(ODI_NIC_FC_ON_LEVEL, ODI_NIC_FC_ON);
+	odi_w8(ODI_NIC_FC_OFF_LEVEL, ODI_NIC_FC_OFF);
+	odi_w8(ODI_NIC_RX1_CPU_IDX, (u8)odi_nic_rx_cpu_idx(0, ODI_RX_RING_DEPTH));
+
+	if (odi_nic_debug)
+		pr_info(DRV_NAME ": rx1_ring wrote 0x%08x read back 0x%08x, rx1_last read back %u/%u, fc word read back 0x%08x\n",
+			(u32)r1->dma, odi_r32(ODI_NIC_RX1_RING),
+			odi_r8(ODI_NIC_RX1_LAST), odi_r8(ODI_NIC_RX1_LAST_HI), odi_r32(ODI_NIC_RX1_CPU_IDX));
+
+	/* The OMCI ring and rings 3 to 6 are left alone here: with RUN1
+	 * MULTI_RX clear the engine runs ring 1 only, and odi_rx_multi_apply()
+	 * programs them when multi-ring RX is turned on.
+	 */
+
+	odi_w32(ODI_NIC_R13FC, 0);
+
+	odi_w8(ODI_NIC_MSR, odi_r8(ODI_NIC_MSR) | ODI_NIC_MSR_FC_ON);
+}
+
+/* The station (own MAC) address; there is one register pair for all five
+ * devices.
+ */
+static void odi_set_station(const u8 *addr)
+{
+	odi_w32(ODI_NIC_STATION0, get_unaligned_be32(addr));
+	odi_w32(ODI_NIC_STATION4, ((u32)addr[4] << 24) | ((u32)addr[5] << 16));
+}
+
+/* The RX FIFO, the RX ring map and the accept mode. */
+static void odi_init_hw_rx(void)
+{
+	unsigned int i;
+
+	/* FIFO_CFG RING_IRQS stays clear: see odi_init_hw_mac(). */
+	odi_w32(ODI_NIC_FIFO_CFG, ODI_NIC_FIFO_RX_2K);
+
+	/* The single-ring route words (odi_nic_hw.h); multi-ring RX rewrites
+	 * them (odi_rx_multi_apply()).
+	 */
+	for (i = 0; i < ODI_NIC_RX_RING_MAP_WORDS; i++)
+		odi_w32(ODI_NIC_RX_RING_MAP + 4 * i, odi_nic_rx_ring_map(0));
+
+	/* Promiscuous: broadcast, multicast, own and any unicast, the hash
+	 * filter wide open. At reset the MAC accepts nothing. The switch
+	 * filters by port, so this costs nothing.
+	 */
+	odi_w32(ODI_NIC_MCHASH0, 0xFFFFFFFFU);
+	odi_w32(ODI_NIC_MCHASH4, 0xFFFFFFFFU);
+	odi_w32(ODI_NIC_RX_FILTER, ODI_NIC_RX_FILTER_ALL);
+}
+
+/* Programs everything but the interrupt mask and the go bits
+ * (odi_start_hw()).
+ */
+static void odi_init_hw(struct net_device *mac_dev)
+{
+	odi_reset_hw();
+	odi_init_hw_mac();
+	odi_init_hw_rings();
+	odi_set_station(mac_dev->dev_addr);
+	odi_init_hw_rx();
+}
+
+/* Enabling is kept apart from programming: the interrupt mask and the go
+ * bits are written only once request_irq and napi_enable have succeeded,
+ * so no interrupt can arrive with no handler or a disabled NAPI context.
+ */
+static void odi_start_hw(void)
+{
+	odi_w16(ODI_NIC_IRQ_MASK, ODI_NIC_IRQ_POLL_SOURCES);
+	odi_w32(ODI_NIC_RUN1, ODI_NIC_RUN1_VAL);
+	odi_w32(ODI_NIC_RUN, ODI_NIC_RUN_VAL);
+}
+
+/* The DMA engine is not reset with the CPU: after a watchdog reset it
+ * kept receiving into our ring while U-Boot and the stock kernel booted,
+ * and the stock kernel died at random points. Plain MMIO and memory
+ * writes only, so this is safe from the watchdog deadline, a reboot
+ * notifier and a panic notifier alike.
+ */
+static void odi_quiesce_hw(void)
+{
+	unsigned int i, r;
+
+	if (!odi_mmio)
+		return;
+	odi_w32(ODI_NIC_RUN, 0);
+	odi_w32(ODI_NIC_RUN1, 0);
+	odi_w16(ODI_NIC_IRQ_MASK, 0);
+	odi_w32(ODI_NIC_RING_IRQ_MASK, 0);
+	odi_w16(ODI_NIC_IRQ_STATUS, ODI_NIC_IRQ_ALL);
+	odi_w32(ODI_NIC_RING_IRQ_STATUS, 0xFFFFFFFFU);
+	for (r = 0; r < ODI_RXR_NUM; r++)
+		if (odi.rx[r].desc)
+			for (i = 0; i < odi.rx[r].depth; i++)
+				odi.rx[r].desc[i].opts1 &= ~ODI_RXD_HW;
+	odi_dma_wmb();
+}
+
+static void odi_stop_hw(void)
+{
+	odi_quiesce_hw();
+	if (odi.irq_requested)
+		synchronize_irq(ODI_NIC_IRQ_NUM);
+	udelay(10);
+}
+
+static int odi_reboot_notify(struct notifier_block *nb, unsigned long action, void *data)
+{
+	odi_quiesce_hw();
+	return NOTIFY_DONE;
+}
+
+static struct notifier_block odi_reboot_nb = { .notifier_call = odi_reboot_notify };
+static struct notifier_block odi_panic_nb = { .notifier_call = odi_reboot_notify };
+
+/* ---- TX ---------------------------------------------------------------
+ *
+ * One ring behind five net_devices and odi_omci.c. When it cannot take
+ * another frame every queue is stopped; reclaim wakes them all once the
+ * ring has drained to ODI_TX_WAKE_USED entries in flight, so a stop/wake
+ * cycle is not paid on every freed slot.
+ */
+#define ODI_TX_WAKE_USED	(ODI_TX_RING_DEPTH / 2)
+#define ODI_TX_STALL_POLL_MS	10	/* tx_stall_work period while stopped */
+#define ODI_TX_BACKSTOP_MS	100	/* tx_backstop_work period while frames are in flight */
+
+static int odi_nic_xmit_desc(unsigned int port_mask, unsigned int prio, int dislrn,
+			      const void *data, unsigned int len)
+{
+	struct odi_tx_desc t;
+
+	odi_nic_tx_pack(&t, port_mask, 0, prio, dislrn);
+	return odi_nic_xmit_raw(t.opts1, t.opts2, t.opts3, data, len);
+}
+
+/* The one test for "cannot take another frame": odi_nic_xmit_raw() refuses
+ * on it and odi_start_xmit() stops the queues on it. Caller holds odi.lock.
+ */
+static bool odi_tx_full_locked(void)
+{
+	lockdep_assert_held(&odi.lock);
+	return odi_ring_is_full(odi.tx_reclaim, odi_ring_next(odi.tx_tail, ODI_TX_RING_DEPTH),
+				ODI_TX_RING_DEPTH);
+}
+
+/* One TX descriptor from caller-supplied words: opts1 flags (never own,
+ * eor, fs, ls or the length), opts2 (CPU tag), opts3 (port mask, stream).
+ */
+static int odi_nic_xmit_raw(u32 opts1, u32 opts2, u32 opts3,
+			     const void *data, unsigned int len)
+{
+	unsigned long flags;
+	unsigned int idx;
+	struct odi_tx_desc *d;
+	dma_addr_t dma;
+	void *buf;
+
+	spin_lock_irqsave(&odi.lock, flags);
+
+	idx = odi.tx_tail;
+	if (odi_tx_full_locked()) {
+		spin_unlock_irqrestore(&odi.lock, flags);
+		return -ENOBUFS;
+	}
+
+	buf = kmalloc(len, GFP_ATOMIC);
+	if (!buf) {
+		spin_unlock_irqrestore(&odi.lock, flags);
+		return -ENOMEM;
+	}
+	memcpy(buf, data, len);
+	dma = dma_map_single(&odi_pdev->dev, buf, len, DMA_TO_DEVICE);
+	if (dma_mapping_error(&odi_pdev->dev, dma)) {
+		kfree(buf);
+		spin_unlock_irqrestore(&odi.lock, flags);
+		return -ENOMEM;
+	}
+
+	d = &odi.tx_ring[idx];
+	/* The FCS and the CPU tag are forced on for every frame: the OMCI
+	 * caller sets neither, and a reply without an FCS makes the OLT
+	 * retransmit the request.
+	 */
+	d->opts2 = opts2 | ODI_TXD_TAGGED;
+	d->opts3 = opts3;
+	d->addr = (u32)dma;
+	d->opts1 = (opts1 & ~(ODI_TXD_HW | ODI_TXD_WRAP | ODI_TXD_FIRST | ODI_TXD_LAST | ODI_TXD_SIZE_MASK)) |
+		   ODI_TXD_FIRST | ODI_TXD_LAST | ODI_TXD_ADD_CRC | (len & ODI_TXD_SIZE_MASK) |
+		   ((idx == ODI_TX_RING_DEPTH - 1) ? ODI_TXD_WRAP : 0);
+	odi_dma_wmb();
+	d->opts1 |= ODI_TXD_HW;	/* HW bit set last */
+
+	odi.tx_buf[idx] = buf;
+	odi.tx_dma[idx] = dma;
+	odi.tx_len[idx] = len;
+	odi.tx_tail = odi_ring_next(idx, ODI_TX_RING_DEPTH);
+	odi.tx_queued++;
+
+	odi_w32(ODI_NIC_RUN, odi_r32(ODI_NIC_RUN) | ODI_NIC_RUN_TX_KICK);
+
+	/* No-op while already pending: the period runs from the first frame. */
+	schedule_delayed_work(&odi.tx_backstop_work, msecs_to_jiffies(ODI_TX_BACKSTOP_MS));
+
+	spin_unlock_irqrestore(&odi.lock, flags);
+	return 0;
+}
+
+static void odi_tx_wake_queues(void)
+{
+	int i;
+
+	for (i = 0; i < ODI_NUM_DEVS; i++) {
+		struct net_device *dev = odi.ports[i].dev;
+
+		if (dev && netif_running(dev) && netif_queue_stopped(dev))
+			netif_wake_queue(dev);
+	}
+}
+
+static bool odi_tx_any_stopped(void)
+{
+	int i;
+
+	for (i = 0; i < ODI_NUM_DEVS; i++) {
+		struct net_device *dev = odi.ports[i].dev;
+
+		if (dev && netif_running(dev) && netif_queue_stopped(dev))
+			return true;
+	}
+	return false;
+}
+
+/* True when the oldest descriptor in flight has been handed back, i.e. a
+ * reclaim would free something. From the interrupt handler, to tell a
+ * TX-completion entry with work from one without.
+ */
+static bool odi_tx_reclaimable(void)
+{
+	unsigned long flags;
+	bool ready;
+
+	spin_lock_irqsave(&odi.lock, flags);
+	ready = odi.tx_reclaim != odi.tx_tail &&
+		!(odi.tx_ring[odi.tx_reclaim].opts1 & ODI_TXD_HW);
+	spin_unlock_irqrestore(&odi.lock, flags);
+	return ready;
+}
+
+/* Reclaim runs from the NAPI poll (scheduled by RX and by the TX-completion
+ * interrupt), from ndo_start_xmit and, as safety nets for a missing
+ * interrupt, from tx_stall_work and tx_backstop_work. Returns how many
+ * descriptors it freed.
+ */
+static unsigned int odi_tx_reclaim(void)
+{
+	unsigned long flags;
+	unsigned int used, freed = 0;
+
+	spin_lock_irqsave(&odi.lock, flags);
+	while (odi.tx_reclaim != odi.tx_tail) {
+		struct odi_tx_desc *d = &odi.tx_ring[odi.tx_reclaim];
+
+		if (d->opts1 & ODI_TXD_HW)
+			break;
+		dma_unmap_single(&odi_pdev->dev, odi.tx_dma[odi.tx_reclaim],
+				  odi.tx_len[odi.tx_reclaim], DMA_TO_DEVICE);
+		kfree(odi.tx_buf[odi.tx_reclaim]);
+		odi.tx_buf[odi.tx_reclaim] = NULL;
+		odi.tx_reclaim = odi_ring_next(odi.tx_reclaim, ODI_TX_RING_DEPTH);
+		freed++;
+	}
+	used = odi_ring_used(odi.tx_reclaim, odi.tx_tail, ODI_TX_RING_DEPTH);
+	spin_unlock_irqrestore(&odi.lock, flags);
+
+	/* Pairs with the smp_mb() in odi_tx_stop_queues(): either the sender
+	 * sees the slots freed above when it re-checks, or this sees its
+	 * queues stopped. Either way no queue stays stopped on a drained ring.
+	 */
+	smp_mb();
+	if (used <= ODI_TX_WAKE_USED)
+		odi_tx_wake_queues();
+	return freed;
+}
+
+static void odi_tx_stop_queues(void)
+{
+	int i;
+
+	for (i = 0; i < ODI_NUM_DEVS; i++)
+		if (odi.ports[i].dev)
+			netif_stop_queue(odi.ports[i].dev);
+	/* Pairs with the smp_mb() in odi_tx_reclaim(). Re-check after the
+	 * stop: a reclaim that ran before it saw no stopped queue to wake;
+	 * this one wakes them if the ring has drained since.
+	 */
+	smp_mb();
+	odi_tx_reclaim();
+	if (odi_tx_any_stopped())
+		schedule_delayed_work(&odi.tx_stall_work, msecs_to_jiffies(ODI_TX_STALL_POLL_MS));
+}
+
+static void odi_tx_stall_work(struct work_struct *work)
+{
+	if (odi_tx_reclaim())
+		odi.backstop_reclaims++;
+	if (odi_tx_any_stopped())
+		schedule_delayed_work(&odi.tx_stall_work, msecs_to_jiffies(ODI_TX_STALL_POLL_MS));
+}
+
+/* Frees what the TX-completion interrupt (or the next poll) has not, then
+ * re-arms while frames remain in flight. With the interrupt working it finds
+ * nothing and backstop_reclaims stays put.
+ */
+static void odi_tx_backstop_work(struct work_struct *work)
+{
+	bool in_flight;
+	unsigned long flags;
+
+	if (odi_tx_reclaim())
+		odi.backstop_reclaims++;
+	spin_lock_irqsave(&odi.lock, flags);
+	in_flight = odi.tx_reclaim != odi.tx_tail;
+	spin_unlock_irqrestore(&odi.lock, flags);
+	if (in_flight)
+		schedule_delayed_work(&odi.tx_backstop_work, msecs_to_jiffies(ODI_TX_BACKSTOP_MS));
+}
+
+static netdev_tx_t odi_start_xmit(struct sk_buff *skb, struct net_device *dev)
+{
+	struct odi_port *p = netdev_priv(dev);
+	/* Host-side ports only, never the fibre; 0 for nas0/pon0, which are
+	 * not wired to a switch port here (odi_nic_hw.h).
+	 */
+	unsigned int mask = odi_nic_stack_tx_mask(p->port);
+	unsigned long flags;
+	bool full;
+	int ret;
+
+	if (!mask) {
+		dev_kfree_skb_any(skb);
+		dev->stats.tx_dropped++;
+		return NETDEV_TX_OK;
+	}
+
+	ret = odi_nic_xmit_desc(mask, 0, 0, skb->data, skb->len);
+	if (ret == -ENOBUFS) {
+		/* Only when another sender (odi_omci.c, which has no queue to
+		 * stop) took the last slot since this queue was last checked.
+		 */
+		odi_tx_stop_queues();
+		return NETDEV_TX_BUSY;
+	}
+	if (ret) {
+		dev->stats.tx_dropped++;
+	} else {
+		dev->stats.tx_packets++;
+		dev->stats.tx_bytes += skb->len;
+	}
+	dev_kfree_skb_any(skb);
+	odi_tx_reclaim();
+
+	spin_lock_irqsave(&odi.lock, flags);
+	full = odi_tx_full_locked();
+	spin_unlock_irqrestore(&odi.lock, flags);
+	if (full)
+		odi_tx_stop_queues();
+	return NETDEV_TX_OK;
+}
+
+/* ---- RX and NAPI -------------------------------------------------------- */
+
+static struct net_device *odi_dev_for_port(unsigned int src_port)
+{
+	int i;
+
+	for (i = 0; i < ODI_NUM_DEVS; i++)
+		if (odi.ports[i].port == src_port)
+			return odi.ports[i].dev;
+	/* No specific claimant: deliver to the catch-all -- eth0 sees what
+	 * nothing more specific claims.
+	 */
+	for (i = 0; i < ODI_NUM_DEVS; i++)
+		if (odi.ports[i].port == ODI_PORT_CATCHALL)
+			return odi.ports[i].dev;
+	return NULL;
+}
+
+static unsigned int odi_rx_log_count;
+
+/* Tell the engine how far the CPU has handed descriptors back
+ * (odi_nic_hw.h, RX1_CPU_IDX and RX2_CPU_IDX), after the own bit: the index
+ * must never count a descriptor the engine cannot see as its own yet. Once
+ * per descriptor, as the stock driver does, so the index only ever moves by
+ * one: once per poll it could move by the whole NAPI budget, which is the
+ * ring-1 depth, and a full poll then wrote the same byte as the one before.
+ * Ring 1 takes one byte, the OMCI ring a whole word.
+ */
+static void odi_rx_cpu_idx_update(unsigned int ring)
+{
+	const struct odi_rxr *r = &odi.rx[ring];
+	unsigned int idx = odi_nic_rx_cpu_idx(r->head, r->depth);
+
+	odi_dma_wmb();
+	if (ring == ODI_RXR_DATA)
+		odi_w8(ODI_NIC_RX1_CPU_IDX, (u8)idx);
+	else
+		odi_w32(ODI_NIC_RX2_CPU_IDX, idx);
+}
+
+/* Take up to budget frames from one ring. Both rings share everything
+ * below: the RX hooks (OMCI, IGMP), the drop of a frame from the PON port
+ * that no hook took, and the hand-off to the net devices.
+ */
+static int odi_rx_ring(unsigned int ring, int budget)
+{
+	struct odi_rxr *r = &odi.rx[ring];
+	int done = 0;
+
+	while (done < budget) {
+		struct odi_rx_desc *d = &r->desc[r->head];
+		struct sk_buff *skb, *fresh;
+		dma_addr_t fresh_dma;
+		unsigned int len, src_port;
+		struct net_device *dev;
+
+		if (d->opts1 & ODI_RXD_HW)
+			break;
+
+		len = odi_nic_rx_len(d);
+		src_port = odi_nic_rx_src_port(d);
+		skb = r->skb[r->head];
+
+		/* odi_nic.debug: the first descriptors, raw. */
+		if (odi_nic_debug && odi_rx_log_count < 6) {
+			pr_info(DRV_NAME ": rx ring %u desc[%u] opts1=0x%08x opts2=0x%08x opts3=0x%08x len=%u src_port=%u first bytes %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x\n",
+				ring, r->head, d->opts1, d->opts2, d->opts3, len, src_port,
+				skb->data[0], skb->data[1], skb->data[2], skb->data[3],
+				skb->data[4], skb->data[5], skb->data[6], skb->data[7],
+				skb->data[8], skb->data[9], skb->data[10], skb->data[11]);
+			odi_rx_log_count++;
+		}
+
+		if (ring == ODI_RXR_OMCI && odi_nic_rx_reason(d) != ODI_NIC_RX_REASON_OMCI)
+			odi.rx2_other++;
+
+		if (!odi_nic_rx_whole(d)) {
+			/* One piece of a frame longer than the buffer. Only the
+			 * first piece has the CPU tag, so the rest would read as
+			 * source port 0 and skip the PON test below: drop every
+			 * piece, which also covers a first one.
+			 */
+			odi.rx_split_dropped++;
+			pr_warn_once(DRV_NAME ": RX descriptor without FIRST and LAST (opts1=0x%08x), dropped; counted in rx_split_dropped\n",
+				     d->opts1);
+			dev = odi_dev_for_port(ODI_PORT_CATCHALL);
+			if (dev)
+				dev->stats.rx_length_errors++;
+			goto requeue;
+		}
+
+		if ((d->opts1 & (ODI_RXD_BAD_CRC | ODI_RXD_TOO_LONG)) ||
+		    len <= ETH_FCS_LEN || len > ODI_NIC_RX_BUF_SIZE) {
+			/* Drop, and give the same buffer back: it is still mapped
+			 * from its last refill, so it is not mapped again (that
+			 * leaked a mapping each time). The length comes from the
+			 * descriptor, so a bad one is caught before the buffer is
+			 * given up.
+			 */
+			dev = odi_dev_for_port(ODI_PORT_CATCHALL);
+			if (dev)
+				dev->stats.rx_errors++;
+			goto requeue;
+		}
+
+		dev = odi_dev_for_port(src_port);
+
+		/* The replacement is allocated and mapped before the received
+		 * buffer is given up. If either fails, the frame is dropped and
+		 * the received buffer, still mapped, goes back to the hardware
+		 * as it is: the ring never points at a buffer it does not own.
+		 */
+		fresh = dev_alloc_skb(ODI_NIC_RX_ALLOC);
+		if (fresh) {
+			fresh_dma = dma_map_single(&odi_pdev->dev, fresh->data,
+						   ODI_NIC_RX_ALLOC, DMA_FROM_DEVICE);
+			if (dma_mapping_error(&odi_pdev->dev, fresh_dma)) {
+				dev_kfree_skb(fresh);
+				fresh = NULL;
+			}
+		}
+		if (!fresh) {
+			if (dev)
+				dev->stats.rx_dropped++;
+			goto requeue;
+		}
+
+		dma_unmap_single(&odi_pdev->dev, d->addr,
+				  ODI_NIC_RX_ALLOC, DMA_FROM_DEVICE);
+		r->skb[r->head] = fresh;
+		skb_reserve(skb, ODI_NIC_RX_OFFSET);
+		skb_put(skb, len - ETH_FCS_LEN);
+
+		if (dev) {
+			skb->dev = dev;
+			dev->stats.rx_packets++;
+			dev->stats.rx_bytes += len;
+			/* Hooks see the frame at the MAC header, as the stock
+			 * callers expect it; eth_type_trans pulls the header and is
+			 * only right for the net device path.
+			 *
+			 * A frame from the PON port that no hook took (OMCI is
+			 * taken) is dropped here: nothing from the fibre reaches
+			 * the IP stack, whatever the switch let through.
+			 */
+			if (odi_nic_rx_from_pon(d))
+				odi.rx_pon++;
+			if (!odi_dispatch_rxhooks(d, src_port, skb)) {
+				if (odi_nic_rx_from_pon(d)) {
+					odi.rx_pon_dropped++;
+					dev->stats.rx_dropped++;
+					dev_kfree_skb(skb);
+				} else {
+					skb->protocol = eth_type_trans(skb, dev);
+					netif_receive_skb(skb);
+				}
+			}
+		} else {
+			dev_kfree_skb(skb);
+		}
+
+		/* Only now: the hooks above get the descriptor words as the
+		 * hardware returned them, addr included.
+		 */
+		d->addr = (u32)fresh_dma;
+requeue:
+		d->opts2 = 0;
+		d->opts3 = 0;
+		odi_dma_wmb();
+		d->opts1 = ODI_RXD_HANDOFF(r->head == r->depth - 1 ? ODI_RXD_WRAP : 0);
+
+		r->head = odi_ring_next(r->head, r->depth);
+		odi_rx_cpu_idx_update(ring);
+		r->taken++;
+		odi.rx_taken++;
+		done++;
+	}
+	return done;
+}
+
+/* The OMCI ring first, so a full budget of ring-1 frames cannot hold an
+ * OMCI frame back; it is served even while nothing is routed to it, so a
+ * frame that arrived before a route change is never left behind. Then the
+ * frames the engine dropped for want of a descriptor, read once a poll.
+ */
+static int odi_poll(struct napi_struct *napi, int budget)
+{
+	u16 missed_now;
+	int done;
+
+	done = odi_rx_ring(ODI_RXR_OMCI, budget);
+	done += odi_rx_ring(ODI_RXR_DATA, budget - done);
+
+	missed_now = odi_r16(ODI_NIC_RX_NO_DESC_CNT);
+	odi.rx_missed += odi_nic_u16_delta(missed_now, odi.rx_missed_last);
+	odi.rx_missed_last = missed_now;
+
+	odi.napi_polls++;
+	odi_tx_reclaim();
+
+	if (done < budget) {
+		napi_complete(napi);
+		odi_w16(ODI_NIC_IRQ_MASK, ODI_NIC_IRQ_POLL_SOURCES);
+	}
+	return done;
+}
+
+/* odi_nic.debug logs the first 20 interrupts. The storm guard
+ * (odi_irq_storm_note()) counts only the entries that schedule no poll
+ * work, RX or TX reclaim.
+ */
+static unsigned int odi_irq_log_count;
+
+static irqreturn_t odi_irq(int irq, void *dev_id)
+{
+	int work = 0;
+	u16 isr;
+
+	odi.irq_entries++;	/* every entry: did the line fire at all */
+
+	if (odi.irq_storm_tripped)
+		return IRQ_NONE;
+
+	isr = odi_r16(ODI_NIC_IRQ_STATUS);
+
+	if (odi_nic_debug && odi_irq_log_count < 20) {
+		pr_info(DRV_NAME ": irq entry #%u, irq_status=0x%04x\n", odi_irq_log_count, isr);
+		odi_irq_log_count++;
+	}
+
+	/* Not ours (the line is shared): the kernel spurious-interrupt
+	 * detector counts IRQ_NONE, so a line stuck with nothing set for us
+	 * is its business, not the guard below.
+	 */
+	if (!isr)
+		return IRQ_NONE;
+
+	odi_w16(ODI_NIC_IRQ_STATUS, isr);	/* write-1-clear */
+
+	if (isr & ODI_NIC_IRQ_TX_OK)
+		odi.tok_irqs++;
+
+	if (odi_nic_irq_has_work(isr, (isr & ODI_NIC_IRQ_TX_OK) ? odi_tx_reclaimable() : 0)) {
+		odi_w16(ODI_NIC_IRQ_MASK, 0);	/* mask the poll sources until the poll re-arms them */
+		if (napi_schedule_prep(&odi.napi)) {
+			__napi_schedule(&odi.napi);
+			work = 1;
+			if (isr & ODI_NIC_IRQ_TX_OK)
+				odi.tok_work++;
+		}
+	} else if (isr & ODI_NIC_IRQ_TX_OK) {
+		odi.tok_idle++;
+		/* The transmit path got to the descriptor first: not a storm
+		 * while it keeps queueing frames. Without any TX activity
+		 * between two such entries it is, and the guard counts it.
+		 */
+		if (odi_nic_tx_progress(&odi.tok_seen_queued, READ_ONCE(odi.tx_queued)))
+			work = 1;
+	}
+
+	if (odi_irq_storm_note(&odi.irq_storm, jiffies_to_msecs(jiffies), work)) {
+		u32 imr_now = odi_r32(ODI_NIC_RING_IRQ_MASK);
+
+		odi_w16(ODI_NIC_IRQ_MASK, 0);
+		odi_w32(ODI_NIC_RING_IRQ_MASK, 0);
+		odi.irq_storm_tripped = 1;
+		pr_alert(DRV_NAME ": interrupt storm, masked -- last irq_status=0x%04x ring_irq_mask was 0x%08x\n",
+			 isr, imr_now);
+		disable_irq_nosync(ODI_NIC_IRQ_NUM);
+	}
+	return IRQ_HANDLED;
+}
+
+/* odi_nic.debug: the NIC registers, the ring state and the counters, three
+ * lines, 15 s after the first open and again 30 s later. The ramlog keeps
+ * them across a watchdog revert.
+ */
+#define ODI_STATE_DUMP_DELAY_MS		15000	/* first dump, after ndo_open */
+#define ODI_STATE_DUMP_RETRY_MS		30000	/* second dump, only if fire == 1 */
+static void odi_state_dump_work(struct work_struct *work)
+{
+	unsigned int i, tx_own = 0, rx_owned_clear = 0;
+	struct net_device *eth0 = odi.ports[0].dev;
+	struct net_device *eth0_2 = odi.ports[1].dev;
+
+	(void)work;
+	odi.state_dump_fire++;
+
+	pr_info(DRV_NAME ": dump%d regs: irq_status=0x%04x irq_mask=0x%04x ring_irq_mask=0x%08x ring_irq_status=0x%08x run=0x%08x run1=0x%08x xfer=0x%08x pause=0x%02x tag_ctrl=0x%08x fifo_cfg=0x%08x\n",
+		odi.state_dump_fire,
+		odi_r16(ODI_NIC_IRQ_STATUS), odi_r16(ODI_NIC_IRQ_MASK), odi_r32(ODI_NIC_RING_IRQ_MASK),
+		odi_r32(ODI_NIC_RING_IRQ_STATUS), odi_r32(ODI_NIC_RUN), odi_r32(ODI_NIC_RUN1),
+		odi_r32(ODI_NIC_XFER_STATUS), odi_r8(ODI_NIC_MSR), odi_r32(ODI_NIC_TAG_CTRL),
+		odi_r32(ODI_NIC_FIFO_CFG));
+
+	for (i = 0; i < ODI_TX_RING_DEPTH; i++)
+		if (odi.tx_ring[i].opts1 & ODI_TXD_HW)
+			tx_own++;
+	for (i = 0; i < odi.rx[ODI_RXR_DATA].depth; i++)
+		if (!(odi.rx[ODI_RXR_DATA].desc[i].opts1 & ODI_RXD_HW))
+			rx_owned_clear++;
+
+	pr_info(DRV_NAME ": dump%d ring: tx1_ring=0x%08x tx1_index=0x%08x rx1_ring=0x%08x rx1_index=0x%08x rx1_fc=0x%08x rx_head=%u tx_tail=%u tx_reclaim=%u tx_own=%u rx_clear=%u rxd0_opts1=0x%08x rx2_index=0x%08x rx2_cpu_idx=0x%08x rx2_head=%u rx_map=0x%08x\n",
+		odi.state_dump_fire,
+		odi_r32(ODI_NIC_TX1_RING), odi_r32(ODI_NIC_TX1_INDEX),
+		odi_r32(ODI_NIC_RX1_RING), odi_r32(ODI_NIC_RX1_INDEX), odi_r32(ODI_NIC_RX1_CPU_IDX),
+		odi.rx[ODI_RXR_DATA].head, odi.tx_tail, odi.tx_reclaim, tx_own, rx_owned_clear,
+		odi.rx[ODI_RXR_DATA].desc[0].opts1,
+		odi_r32(ODI_NIC_RX2_INDEX), odi_r32(ODI_NIC_RX2_CPU_IDX), odi.rx[ODI_RXR_OMCI].head,
+		odi_r32(ODI_NIC_RX_RING_MAP));
+
+	pr_info(DRV_NAME ": dump%d counters: irq_entries=%u napi_polls=%u tok_irqs=%u tok_work=%u tok_idle=%u backstop_reclaims=%u eth0 tx=%lu rx=%lu drop=%lu eth0.2 tx=%lu rx=%lu drop=%lu\n",
+		odi.state_dump_fire, odi.irq_entries, odi.napi_polls,
+		odi.tok_irqs, odi.tok_work, odi.tok_idle, odi.backstop_reclaims,
+		eth0 ? eth0->stats.tx_packets : 0, eth0 ? eth0->stats.rx_packets : 0,
+		eth0 ? eth0->stats.tx_dropped : 0,
+		eth0_2 ? eth0_2->stats.tx_packets : 0, eth0_2 ? eth0_2->stats.rx_packets : 0,
+		eth0_2 ? eth0_2->stats.tx_dropped : 0);
+
+	if (odi.state_dump_fire == 1)
+		schedule_delayed_work(&odi.state_dump_work, msecs_to_jiffies(ODI_STATE_DUMP_RETRY_MS));
+}
+
+/* ---- net_device_ops ----------------------------------------------------
+ *
+ * The first open brings the shared hardware up; the others share it. The
+ * carrier is on at open: the link state is a switch-side interrupt this
+ * driver does not take.
+ */
+
+static atomic_t odi_open_count = ATOMIC_INIT(0);
+
+static void odi_regw_apply(const struct odi_nic_regw *w, unsigned int n)
+{
+	unsigned int i;
+
+	for (i = 0; i < n; i++) {
+		if (w[i].width == 8)
+			odi_w8(w[i].off, (u8)w[i].val);
+		else if (w[i].width == 16)
+			odi_w16(w[i].off, (u16)w[i].val);
+		else
+			odi_w32(w[i].off, w[i].val);
+	}
+}
+
+/* Multi-ring RX on or off (odi_nic_hw.h, "Multi-ring RX: the enable and
+ * disable sequences"), with a device open, under the RTNL: from the first
+ * ndo_open and from the parameter, so the two never interleave. On, NAPI
+ * is held off while ring 2 is reprogrammed, since the poll reads its head,
+ * and scheduled again afterwards: an interrupt in between masked the
+ * poll sources and could not schedule the poll that re-arms them.
+ */
+static void odi_rx_multi_apply(bool on)
+{
+	struct odi_nic_regw w[ODI_NIC_MULTI_RX_ON_MAX];
+	struct odi_nic_multi_rx_cfg c;
+	unsigned int n, r, head = 0;
+
+	ASSERT_RTNL();
+	if (on == !!odi.rx2_routed)
+		return;
+
+	if (!on) {
+		n = odi_nic_multi_rx_off(w);
+		odi_regw_apply(w, n);
+		WRITE_ONCE(odi.rx2_routed, 0);
+		pr_info(DRV_NAME ": omci ring off: one RX ring, run1=0x%08x\n", odi_r32(ODI_NIC_RUN1));
+		return;
+	}
+
+	memset(&c, 0, sizeof(c));
+	c.rx2_dma = (u32)odi.rx[ODI_RXR_OMCI].dma;
+	c.rx2_depth = odi.rx[ODI_RXR_OMCI].depth;
+	c.park_dma = (u32)odi.park_dma;
+	for (r = 2; r <= ODI_NIC_RX_PARK_LAST; r++)
+		c.hw_idx[r] = odi_r16(ODI_NIC_RXN_INDEX(r));
+
+	napi_disable(&odi.napi);
+	n = odi_nic_multi_rx_on(&c, w, &head);
+	if (n) {
+		odi_regw_apply(w, n);
+		odi.rx[ODI_RXR_OMCI].head = head;
+		WRITE_ONCE(odi.rx2_routed, 1);
+	}
+	napi_enable(&odi.napi);
+	local_bh_disable();
+	napi_schedule(&odi.napi);
+	local_bh_enable();
+
+	if (!n) {
+		pr_warn(DRV_NAME ": omci ring not turned on: an RX ring engine index is beyond its ring (rings 2..6: %u %u %u %u %u)\n",
+			c.hw_idx[2], c.hw_idx[3], c.hw_idx[4], c.hw_idx[5], c.hw_idx[6]);
+		return;
+	}
+	pr_info(DRV_NAME ": omci ring on: ring 2 at engine index %u, rings 3..6 parked, run1=0x%08x route=0x%08x pause=0x%02x\n",
+		head, odi_r32(ODI_NIC_RUN1), odi_r32(ODI_NIC_RX_RING_MAP), odi_r8(ODI_NIC_MSR));
+}
+
+/* Written on the command line it is read before any device is open and
+ * takes effect at the first ndo_open; written to
+ * /sys/module/odi_nic/parameters/omci_ring while one is, at once.
+ */
+static int odi_nic_omci_ring_set(const char *val, const struct kernel_param *kp)
+{
+	bool on;
+	int rc;
+
+	rc = kstrtobool(val, &on);
+	if (rc)
+		return rc;
+	rtnl_lock();
+	odi_nic_omci_ring = on;
+	if (atomic_read(&odi_open_count) > 0)
+		odi_rx_multi_apply(on);
+	rtnl_unlock();
+	return 0;
+}
+
+static const struct kernel_param_ops odi_nic_omci_ring_ops = {
+	.set = odi_nic_omci_ring_set,
+	.get = param_get_bool,
+};
+module_param_cb(omci_ring, &odi_nic_omci_ring_ops, &odi_nic_omci_ring, 0644);
+MODULE_PARM_DESC(omci_ring, "run a second receive ring and route the OMCI frames to it (default: no, one ring)");
+
+static int odi_ndo_open(struct net_device *dev)
+{
+	if (odi_nic_debug)
+		pr_info(DRV_NAME ": ndo_open(%s), open_count was %d\n",
+			dev->name, atomic_read(&odi_open_count));
+
+	if (atomic_inc_return(&odi_open_count) == 1) {
+		int ret = odi_rings_alloc(&odi_pdev->dev);
+
+		if (ret) {
+			pr_err(DRV_NAME ": odi_rings_alloc failed, ret %d\n", ret);
+			odi_rings_free(&odi_pdev->dev);
+			atomic_dec(&odi_open_count);
+			return ret;
+		}
+		odi.napi_dev = dev;
+		odi.irq_storm.count = 0;
+		odi.irq_storm_tripped = 0;
+		odi_irq_log_count = 0;
+		odi_init_hw(dev);
+
+		ret = request_irq(ODI_NIC_IRQ_NUM, odi_irq, IRQF_SHARED, DRV_NAME, &odi);
+		if (ret) {
+			pr_err(DRV_NAME ": request_irq failed, ret %d\n", ret);
+			odi_rings_free(&odi_pdev->dev);
+			atomic_dec(&odi_open_count);
+			return ret;
+		}
+		odi.irq_requested = 1;
+		napi_enable(&odi.napi);
+		odi_start_hw();
+		pr_info(DRV_NAME ": IRQ requested, NAPI enabled, hardware live\n");
+
+		odi.irq_entries = 0;
+		odi.napi_polls = 0;
+		odi.tok_irqs = 0;
+		odi.tok_work = 0;
+		odi.tok_idle = 0;
+		odi.tok_seen_queued = READ_ONCE(odi.tx_queued);
+		odi.backstop_reclaims = 0;
+		odi.rx_missed_last = odi_r16(ODI_NIC_RX_NO_DESC_CNT);
+		odi.state_dump_fire = 0;
+		/* odi_reset_hw() left one RX ring running, whatever ran before. */
+		odi.rx2_routed = 0;
+		if (odi_nic_omci_ring)
+			odi_rx_multi_apply(true);
+		if (odi_nic_debug)
+			schedule_delayed_work(&odi.state_dump_work,
+					      msecs_to_jiffies(ODI_STATE_DUMP_DELAY_MS));
+	}
+
+	netif_carrier_on(dev);
+	netif_start_queue(dev);
+	if (odi_nic_debug)
+		pr_info(DRV_NAME ": ndo_open(%s) done\n", dev->name);
+	return 0;
+}
+
+static int odi_ndo_stop(struct net_device *dev)
+{
+	netif_stop_queue(dev);
+	netif_carrier_off(dev);
+
+	if (atomic_dec_return(&odi_open_count) == 0) {
+		cancel_delayed_work_sync(&odi.state_dump_work);
+		napi_disable(&odi.napi);
+		/* After napi_disable and with every queue down, nothing can
+		 * re-arm it; it must be gone before the rings are freed.
+		 */
+		cancel_delayed_work_sync(&odi.tx_stall_work);
+		odi_stop_hw();
+		if (odi.irq_requested) {
+			free_irq(ODI_NIC_IRQ_NUM, &odi);
+			odi.irq_requested = 0;
+		}
+		/* The backstop is armed by every queued frame, not only from a
+		 * stopped queue: cancel it once the hardware is quiet too.
+		 */
+		cancel_delayed_work_sync(&odi.tx_backstop_work);
+		odi_rings_free(&odi_pdev->dev);
+	}
+	return 0;
+}
+
+/* ---- For odi_wdt (odi_nic.h) ------------------------------------------- */
+
+bool odi_nic_rx_taken(u32 *taken)
+{
+	if (atomic_read(&odi_open_count) == 0)
+		return false;	/* closed: no RX expected, nothing to judge */
+	/* Ring 1 only: the ring the host side and the management traffic
+	 * arrive on. OMCI on the OMCI ring must not keep the rule from seeing
+	 * a ring 1 that takes nothing.
+	 */
+	*taken = READ_ONCE(odi.rx[ODI_RXR_DATA].taken);
+	return true;
+}
+
+/* One line, from the watchdog timer right before it resets: MMIO reads
+ * and plain fields only. rx1_fc is the word at RX1_CPU_IDX (index, then
+ * the two thresholds); rx1_index has the hardware index in its high half.
+ */
+void odi_nic_report(void)
+{
+	pr_emerg(DRV_NAME ": irq_status=0x%04x irq_mask=0x%04x rx1_index=0x%08x rx1_fc=0x%08x rx2_index=0x%08x rx2_cpu_idx=0x%08x pause=0x%02x rx_head=%u rx2_head=%u rx_taken=%u rx_missed=%u irq_entries=%u napi_polls=%u tok_irqs=%u tok_work=%u backstop_reclaims=%u storm=%d\n",
+		 odi_r16(ODI_NIC_IRQ_STATUS), odi_r16(ODI_NIC_IRQ_MASK),
+		 odi_r32(ODI_NIC_RX1_INDEX), odi_r32(ODI_NIC_RX1_CPU_IDX),
+		 odi_r32(ODI_NIC_RX2_INDEX), odi_r32(ODI_NIC_RX2_CPU_IDX), odi_r8(ODI_NIC_MSR),
+		 odi.rx[ODI_RXR_DATA].head, odi.rx[ODI_RXR_OMCI].head, odi.rx_taken, odi.rx_missed,
+		 odi.irq_entries, odi.napi_polls,
+		 odi.tok_irqs, odi.tok_work, odi.backstop_reclaims, odi.irq_storm_tripped);
+}
+
+/* /proc/odi_nic: the interrupt and reclaim counters, one per line, then
+ * the frames from the PON port (rx_pon, OMCI included) and those dropped
+ * because no RX hook took them (rx_pon_dropped), then the descriptors
+ * dropped for not being a whole frame (rx_split_dropped). Then the OMCI
+ * ring: omci_ring 1 while priority 7 is routed to it (0 when
+ * odi_nic.omci_ring is off or its engine index was beyond it at open),
+ * rx1_taken and rx2_taken the descriptors taken from each ring (their sum
+ * is rx_taken while the counters have not wrapped), rx2_other the frames on
+ * the OMCI ring that were not OMCI, and rx_missed the frames the engine
+ * dropped with no free descriptor on either ring. tok_irqs
+ * is the number of interrupt entries that carried the TX-completion bit:
+ * zero under TX traffic means the interrupt does not fire on this unit and
+ * every reclaim came from the poll, the xmit path or the backstop.
+ * backstop_reclaims counts work runs that freed descriptors nothing else
+ * had: it stays near zero when the interrupt is doing its job.
+ */
+static int odi_nic_proc_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "irq_entries %u\nnapi_polls %u\ntok_irqs %u\ntok_work %u\ntok_idle %u\nbackstop_reclaims %u\nrx_taken %u\nstorm_tripped %d\nrx_pon %u\nrx_pon_dropped %u\nrx_split_dropped %u\n",
+		   odi.irq_entries, odi.napi_polls, odi.tok_irqs, odi.tok_work,
+		   odi.tok_idle, odi.backstop_reclaims, odi.rx_taken, odi.irq_storm_tripped,
+		   odi.rx_pon, odi.rx_pon_dropped, odi.rx_split_dropped);
+	seq_printf(m, "omci_ring %d\nrx1_taken %u\nrx2_taken %u\nrx2_other %u\nrx_missed %u\n",
+		   READ_ONCE(odi.rx2_routed), odi.rx[ODI_RXR_DATA].taken,
+		   odi.rx[ODI_RXR_OMCI].taken, odi.rx2_other, odi.rx_missed);
+	return 0;
+}
+
+static int odi_ndo_set_mac_address(struct net_device *dev, void *p)
+{
+	struct sockaddr *addr = p;
+
+	if (!is_valid_ether_addr(addr->sa_data))
+		return -EADDRNOTAVAIL;
+	eth_hw_addr_set(dev, addr->sa_data);
+
+	/* The station address follows the device that brought the hardware
+	 * up; the others keep their dev_addr for the stack only.
+	 */
+	if (dev == odi.napi_dev)
+		odi_set_station(dev->dev_addr);
+	return 0;
+}
+
+static void odi_get_drvinfo(struct net_device *dev, struct ethtool_drvinfo *info)
+{
+	strscpy(info->driver, DRV_NAME, sizeof(info->driver));
+	strscpy(info->bus_info, "platform", sizeof(info->bus_info));
+}
+
+static const struct ethtool_ops odi_ethtool_ops = {
+	.get_drvinfo = odi_get_drvinfo,
+};
+
+static const struct net_device_ops odi_netdev_ops;
+
+bool odi_nic_dev_transmits(const struct net_device *dev)
+{
+	const struct odi_port *p;
+
+	if (dev->netdev_ops != &odi_netdev_ops)
+		return false;
+	p = netdev_priv(dev);
+	return odi_nic_stack_tx_mask(p->port) != 0;
+}
+
+static const struct net_device_ops odi_netdev_ops = {
+	.ndo_open = odi_ndo_open,
+	.ndo_stop = odi_ndo_stop,
+	.ndo_start_xmit = odi_start_xmit,
+	.ndo_set_mac_address = odi_ndo_set_mac_address,
+	.ndo_validate_addr = eth_validate_addr,
+	/* .ndo_change_mtu unset: the core enforces min_mtu/max_mtu itself. */
+};
+
+/* ---- Init --------------------------------------------------------------- */
+
+static const char * const odi_dev_names[ODI_NUM_DEVS] = {
+	"eth0", "eth0.2", "eth0.3", "nas0", "pon0",
+};
+static const unsigned int odi_dev_ports[ODI_NUM_DEVS] = {
+	ODI_PORT_CATCHALL, ODI_PORT_LAN0, ODI_PORT_LAN1, ODI_PORT_NONE, ODI_PORT_NONE,
+};
+
+/* The platform device the DMA API works on (odi_pdev), with 32-bit masks.
+ * platform_device_register_simple() sets no dma_mask pointer, and without
+ * one dma_set_mask() fails with -EIO.
+ */
+static int odi_nic_dma_device_register(void)
+{
+	int ret;
+
+	odi_pdev = platform_device_register_simple(DRV_NAME, -1, NULL, 0);
+	if (IS_ERR(odi_pdev)) {
+		pr_err(DRV_NAME ": failed to register platform device\n");
+		ret = PTR_ERR(odi_pdev);
+		odi_pdev = NULL;
+		return ret;
+	}
+	odi_pdev->dev.dma_mask = &odi_pdev->dev.coherent_dma_mask;
+	ret = dma_set_coherent_mask(&odi_pdev->dev, DMA_BIT_MASK(32));
+	if (!ret)
+		ret = dma_set_mask(&odi_pdev->dev, DMA_BIT_MASK(32));
+	if (ret) {
+		pr_err(DRV_NAME ": failed to set DMA mask\n");
+		platform_device_unregister(odi_pdev);
+		odi_pdev = NULL;
+	}
+	return ret;
+}
+
+static void odi_nic_unregister_netdevs(void)
+{
+	int i;
+
+	for (i = 0; i < ODI_NUM_DEVS; i++) {
+		if (odi.ports[i].dev) {
+			unregister_netdev(odi.ports[i].dev);
+			free_netdev(odi.ports[i].dev);
+			odi.ports[i].dev = NULL;
+		}
+	}
+}
+
+/* The five net devices, NAPI on the first (the catch-all), which services
+ * the one ring set. On failure none stays registered.
+ */
+static int odi_nic_register_netdevs(void)
+{
+	int i, ret;
+
+	for (i = 0; i < ODI_NUM_DEVS; i++) {
+		struct net_device *dev = alloc_etherdev(sizeof(struct odi_port));
+		struct odi_port *p;
+
+		if (!dev) {
+			ret = -ENOMEM;
+			goto err;
+		}
+		strscpy(dev->name, odi_dev_names[i], IFNAMSIZ);
+		dev->netdev_ops = &odi_netdev_ops;
+		dev->ethtool_ops = &odi_ethtool_ops;
+		eth_hw_addr_random(dev);	/* placeholder; network.sh sets the real one */
+
+		p = netdev_priv(dev);
+		p->dev = dev;
+		p->port = odi_dev_ports[i];
+		odi.ports[i].dev = dev;
+		odi.ports[i].port = odi_dev_ports[i];
+
+		if (i == 0)
+			netif_napi_add_weight(dev, &odi.napi, odi_poll, NAPI_POLL_WEIGHT);
+
+		ret = register_netdev(dev);
+		if (ret) {
+			free_netdev(dev);
+			odi.ports[i].dev = NULL;
+			goto err;
+		}
+	}
+	return 0;
+err:
+	odi_nic_unregister_netdevs();
+	return ret;
+}
+
+static int __init odi_nic_init(void)
+{
+	int ret;
+
+	/* One byte each, high nibbles left at 0: odi_init_hw_rings(). */
+	BUILD_BUG_ON(ODI_RX_RING_DEPTH > 256);
+	BUILD_BUG_ON(ODI_NIC_FC_OFF > 255 || ODI_NIC_FC_OFF >= ODI_RX_RING_DEPTH);
+	BUILD_BUG_ON(ODI_NIC_FC_ON >= ODI_NIC_FC_OFF);
+	/* The OMCI ring thresholds are one byte each, the depth a 16-bit field. */
+	BUILD_BUG_ON(ODI_NIC_RX2_FC_OFF > 255 || ODI_NIC_RX2_FC_OFF >= ODI_RX2_RING_DEPTH);
+	BUILD_BUG_ON(ODI_NIC_RX2_FC_ON >= ODI_NIC_RX2_FC_OFF);
+	BUILD_BUG_ON(ODI_RX2_RING_DEPTH > 0x10000);
+	/* The parking ring: its descriptors before its buffer, the buffer as
+	 * large as any RX buffer.
+	 */
+	BUILD_BUG_ON(ODI_NIC_RX_PARK_DEPTH * sizeof(struct odi_rx_desc) > ODI_NIC_PARK_BUF_OFF);
+	BUILD_BUG_ON(ODI_NIC_PARK_ALLOC - ODI_NIC_PARK_BUF_OFF < ODI_NIC_RX_ALLOC);
+
+	odi_mmio = ioremap(CPHYSADDR(ODI_NIC_MMIO_BASE), ODI_NIC_MMIO_SIZE);
+	if (!odi_mmio) {
+		pr_err(DRV_NAME ": failed to map MMIO window\n");
+		return -ENODEV;
+	}
+
+	ret = odi_nic_dma_device_register();
+	if (ret)
+		goto err_unmap;
+
+	spin_lock_init(&odi.lock);
+	INIT_DELAYED_WORK(&odi.tx_stall_work, odi_tx_stall_work);
+	INIT_DELAYED_WORK(&odi.tx_backstop_work, odi_tx_backstop_work);
+	INIT_DELAYED_WORK(&odi.state_dump_work, odi_state_dump_work);
+
+	/* Before the net devices: the first ndo_open starts the DMA engine,
+	 * and from then on a reboot, a panic or a watchdog reset must stop it.
+	 */
+	register_reboot_notifier(&odi_reboot_nb);
+	atomic_notifier_chain_register(&panic_notifier_list, &odi_panic_nb);
+	wdt_pre_reset_hook = odi_quiesce_hw;
+
+	ret = odi_nic_register_netdevs();
+	if (ret)
+		goto err_notifiers;
+
+	proc_create_single("odi_nic", 0444, NULL, odi_nic_proc_show);
+
+	pr_info(DRV_NAME ": %d net devices registered, IRQ %d\n", ODI_NUM_DEVS, ODI_NIC_IRQ_NUM);
+	return 0;
+
+err_notifiers:
+	wdt_pre_reset_hook = NULL;
+	atomic_notifier_chain_unregister(&panic_notifier_list, &odi_panic_nb);
+	unregister_reboot_notifier(&odi_reboot_nb);
+	platform_device_unregister(odi_pdev);
+	odi_pdev = NULL;
+err_unmap:
+	iounmap(odi_mmio);
+	odi_mmio = NULL;	/* odi_quiesce_hw() tests it */
+	return ret;
+}
+
+module_init(odi_nic_init);
+
+MODULE_LICENSE("GPL");
+MODULE_DESCRIPTION("Open driver for the RTL9602C CPU-port NIC");
+MODULE_AUTHOR("odi-oss");

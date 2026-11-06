@@ -1,0 +1,703 @@
+{
+  "image": "odi-calix-mib-r7-20261106",
+  "base_image": "odi-calix-compat-r6-20261105",
+  "original_js_sha256": "13e6abc9d0477b4afdb8f4b9cf3a922e9ca99bb94b28ac0e488be0ce9f72ea68",
+  "patched_js_sha256": "1de8eadf3ecbe783b95018d54f1daf9801bb591b5e95fc5f3325bb52f4774754",
+  "original_catalog_count": 82,
+  "catalog_count": 106,
+  "calix_models": {
+    "241": "Information",
+    "244": "PotsUniExt",
+    "65280": "CalixVoipCallStatistics",
+    "65281": "CalixVoipCallStatisticsExt2",
+    "65282": "CalixVoipCallStatisticsExt3",
+    "65283": "CalixVoipCallStatisticsExt4",
+    "65311": "EthernetUniHCExt",
+    "251": "EthernetUniExtConfig",
+    "407": "SipAgentConfigData2",
+    "65319": "LldpMedControl"
+  },
+  "added": [
+    [
+      53,
+      "PptpPotsUni",
+      "PPTP POTS UNI"
+    ],
+    [
+      58,
+      "VoiceServiceProfile",
+      "Voice service profile"
+    ],
+    [
+      138,
+      "VoipConfigData",
+      "VoIP config data"
+    ],
+    [
+      139,
+      "VoipVoiceCtp",
+      "VoIP voice CTP"
+    ],
+    [
+      140,
+      "CallControlPmHistoryData",
+      "Call control performance monitoring history data"
+    ],
+    [
+      141,
+      "VoipLineStatus",
+      "VoIP line status"
+    ],
+    [
+      142,
+      "VoipMediaProfile",
+      "VoIP media profile"
+    ],
+    [
+      143,
+      "RtpProfileData",
+      "RTP profile data"
+    ],
+    [
+      144,
+      "RtpPmHistoryData",
+      "RTP performance monitoring history data"
+    ],
+    [
+      145,
+      "NetworkDialPlanTable",
+      "Network dial plan table"
+    ],
+    [
+      146,
+      "VoipAppServiceProfile",
+      "VoIP application service profile"
+    ],
+    [
+      147,
+      "VoipFeatureAccessCodes",
+      "VoIP feature access codes"
+    ],
+    [
+      150,
+      "SipAgentConfigData",
+      "SIP agent config data"
+    ],
+    [
+      151,
+      "SipAgentPmHistoryData",
+      "SIP agent performance monitoring history data"
+    ],
+    [
+      152,
+      "SipCallInitPmHistoryData",
+      "SIP call initiation performance monitoring history data"
+    ],
+    [
+      153,
+      "SipUserData",
+      "SIP user data"
+    ],
+    [
+      241,
+      "Information",
+      "Calix ONU information"
+    ],
+    [
+      251,
+      "EthernetUniExtConfig",
+      "Calix Ethernet UNI extended configuration"
+    ],
+    [
+      407,
+      "SipAgentConfigData2",
+      "SIP agent config data 2 (Calix profile)"
+    ],
+    [
+      65280,
+      "CalixVoipCallStatistics",
+      "Calix VoIP call statistics"
+    ],
+    [
+      65281,
+      "CalixVoipCallStatisticsExt2",
+      "Calix VoIP call statistics extension 2"
+    ],
+    [
+      65283,
+      "CalixVoipCallStatisticsExt4",
+      "Calix VoIP call statistics extension 4"
+    ],
+    [
+      65311,
+      "EthernetUniHCExt",
+      "Calix Ethernet UNI high-capacity counters"
+    ],
+    [
+      65319,
+      "LldpMedControl",
+      "Calix LLDP MED control"
+    ]
+  ],
+  "renamed": [
+    {
+      "class_id": 244,
+      "before": [
+        244,
+        "OntSelfLoopDetect",
+        "ONU self loop detect"
+      ],
+      "after": [
+        244,
+        "PotsUniExt",
+        "Calix POTS UNI extension"
+      ]
+    },
+    {
+      "class_id": 65282,
+      "before": [
+        65282,
+        "PrivateMcastTag",
+        "Private multicast tag"
+      ],
+      "after": [
+        65282,
+        "CalixVoipCallStatisticsExt3",
+        "Calix VoIP call statistics extension 3"
+      ]
+    }
+  ],
+  "catalog": [
+    [
+      2,
+      "OntData",
+      "ONU data"
+    ],
+    [
+      5,
+      "Cardholder",
+      "Cardholder"
+    ],
+    [
+      6,
+      "CircuitPack",
+      "Circuit pack"
+    ],
+    [
+      7,
+      "SWImage",
+      "Software image"
+    ],
+    [
+      11,
+      "EthUni",
+      "Physical path termination point Ethernet UNI"
+    ],
+    [
+      24,
+      "EthPmHistoryData",
+      "Ethernet performance monitoring history data"
+    ],
+    [
+      45,
+      "MacBriServProf",
+      "MAC bridge service profile"
+    ],
+    [
+      46,
+      "MacBriCfgData",
+      "MAC bridge configuration data"
+    ],
+    [
+      47,
+      "MacBriPortCfgData",
+      "MAC bridge port configuration data"
+    ],
+    [
+      49,
+      "MacBridgePortFilterTable",
+      "MAC bridge port filter table data"
+    ],
+    [
+      50,
+      "MacBriPortBriTblData",
+      "MAC bridge port bridge table data"
+    ],
+    [
+      52,
+      "MacBridgePortPmMonitorHistoryData",
+      "MAC bridge port performance monitoring history data"
+    ],
+    [
+      53,
+      "PptpPotsUni",
+      "PPTP POTS UNI"
+    ],
+    [
+      58,
+      "VoiceServiceProfile",
+      "Voice service profile"
+    ],
+    [
+      78,
+      "VlanTagOpCfgData",
+      "VLAN tagging operation configuration data"
+    ],
+    [
+      79,
+      "MacBridgePortFilterPreassign",
+      "MAC bridge port filter preassign table"
+    ],
+    [
+      83,
+      "LctUni",
+      "Physical path termination point LCT UNI"
+    ],
+    [
+      84,
+      "VlanTagFilterData",
+      "VLAN tagging filter data"
+    ],
+    [
+      89,
+      "EthPmData2",
+      "Ethernet performance monitoring history data 2"
+    ],
+    [
+      130,
+      "Map8021pServProf",
+      "IEEE 802.1p mapper service profile"
+    ],
+    [
+      131,
+      "OltG",
+      "OLT-G"
+    ],
+    [
+      133,
+      "OnuPwrShedding",
+      "ONU power shedding"
+    ],
+    [
+      134,
+      "IpHostCfgData",
+      "IP host config data"
+    ],
+    [
+      136,
+      "TcpUdpCfgData",
+      "TCP/UDP config data"
+    ],
+    [
+      137,
+      "NetworkAddress",
+      "Network address"
+    ],
+    [
+      138,
+      "VoipConfigData",
+      "VoIP config data"
+    ],
+    [
+      139,
+      "VoipVoiceCtp",
+      "VoIP voice CTP"
+    ],
+    [
+      140,
+      "CallControlPmHistoryData",
+      "Call control performance monitoring history data"
+    ],
+    [
+      141,
+      "VoipLineStatus",
+      "VoIP line status"
+    ],
+    [
+      142,
+      "VoipMediaProfile",
+      "VoIP media profile"
+    ],
+    [
+      143,
+      "RtpProfileData",
+      "RTP profile data"
+    ],
+    [
+      144,
+      "RtpPmHistoryData",
+      "RTP performance monitoring history data"
+    ],
+    [
+      145,
+      "NetworkDialPlanTable",
+      "Network dial plan table"
+    ],
+    [
+      146,
+      "VoipAppServiceProfile",
+      "VoIP application service profile"
+    ],
+    [
+      147,
+      "VoipFeatureAccessCodes",
+      "VoIP feature access codes"
+    ],
+    [
+      148,
+      "AuthSecMethod",
+      "Authentication security method"
+    ],
+    [
+      150,
+      "SipAgentConfigData",
+      "SIP agent config data"
+    ],
+    [
+      151,
+      "SipAgentPmHistoryData",
+      "SIP agent performance monitoring history data"
+    ],
+    [
+      152,
+      "SipCallInitPmHistoryData",
+      "SIP call initiation performance monitoring history data"
+    ],
+    [
+      153,
+      "SipUserData",
+      "SIP user data"
+    ],
+    [
+      157,
+      "LargeString",
+      "Large string"
+    ],
+    [
+      158,
+      "OnuRemoteDebug",
+      "ONU remote debug"
+    ],
+    [
+      171,
+      "ExtVlanTagOperCfgData",
+      "Extended VLAN tagging operation configuration data"
+    ],
+    [
+      240,
+      "OntSystemMgmt",
+      "ONU system management"
+    ],
+    [
+      241,
+      "Information",
+      "Calix ONU information"
+    ],
+    [
+      242,
+      "Me242",
+      "ME 242"
+    ],
+    [
+      243,
+      "PrivateQueueMap",
+      "Private queue map"
+    ],
+    [
+      244,
+      "PotsUniExt",
+      "Calix POTS UNI extension"
+    ],
+    [
+      245,
+      "HSQDefault",
+      "Default to factory"
+    ],
+    [
+      248,
+      "WANConfigCata",
+      "WAN interface config"
+    ],
+    [
+      249,
+      "WANConfigCataDeti",
+      "WAN interface config Deti"
+    ],
+    [
+      250,
+      "ExtIpHostCfgData",
+      "PPPoE interface"
+    ],
+    [
+      251,
+      "EthernetUniExtConfig",
+      "Calix Ethernet UNI extended configuration"
+    ],
+    [
+      253,
+      "LoopDetect",
+      "Loop detect"
+    ],
+    [
+      255,
+      "PrivateTellionOntStatistics",
+      "Private ONU statistics"
+    ],
+    [
+      256,
+      "Ontg",
+      "ONU-G"
+    ],
+    [
+      257,
+      "Ont2g",
+      "ONU2-G"
+    ],
+    [
+      262,
+      "Tcont",
+      "T-CONT"
+    ],
+    [
+      263,
+      "Anig",
+      "ANI-G"
+    ],
+    [
+      264,
+      "Unig",
+      "UNI-G"
+    ],
+    [
+      266,
+      "GemIwTp",
+      "GEM interworking termination point"
+    ],
+    [
+      267,
+      "GemPortPmhd",
+      "GEM port performance monitoring history data"
+    ],
+    [
+      268,
+      "GemPortCtp",
+      "GEM port network CTP"
+    ],
+    [
+      272,
+      "GalEthProf",
+      "GAL Ethernet profile"
+    ],
+    [
+      273,
+      "ThresholdData1",
+      "Threshold data 1"
+    ],
+    [
+      274,
+      "ThresholdData2",
+      "Threshold data 2"
+    ],
+    [
+      277,
+      "PriQ",
+      "Priority queue"
+    ],
+    [
+      278,
+      "Scheduler",
+      "Traffic scheduler"
+    ],
+    [
+      280,
+      "TrafficDescriptor",
+      "Traffic descriptor"
+    ],
+    [
+      281,
+      "MultiGemIwTp",
+      "Multicast GEM interworking termination point"
+    ],
+    [
+      284,
+      "PseudowireMaintenanceProfile",
+      "Pseudowire maintenance profile"
+    ],
+    [
+      287,
+      "Omci",
+      "OMCI"
+    ],
+    [
+      296,
+      "EthPmData3",
+      "Ethernet performance monitoring history data 3"
+    ],
+    [
+      298,
+      "Dot1RateLimiter",
+      "Dot1 rate limiter"
+    ],
+    [
+      307,
+      "LargeString",
+      "Octet string"
+    ],
+    [
+      308,
+      "GeneralPurposeBuffer",
+      "General purpose buffer"
+    ],
+    [
+      309,
+      "McastOperProf",
+      "Multicast operations profile"
+    ],
+    [
+      310,
+      "McastSubConfInfo",
+      "Multicast subscriber config info"
+    ],
+    [
+      311,
+      "McastSubMonitor",
+      "Multicast subscriber monitor"
+    ],
+    [
+      312,
+      "FecPmhd",
+      "FEC performance monitoring history data"
+    ],
+    [
+      321,
+      "EthPmDataDs",
+      "Ethernet frame performance monitoring history data downstream"
+    ],
+    [
+      322,
+      "EthPmDataUs",
+      "Ethernet frame performance monitoring history data upstream"
+    ],
+    [
+      329,
+      "VEIP",
+      "Virtual Ethernet interface point"
+    ],
+    [
+      330,
+      "GenericStatusPortal",
+      "Generic status portal"
+    ],
+    [
+      334,
+      "EthExtPmData",
+      "Ethernet frame extended PM"
+    ],
+    [
+      340,
+      "TR069ManageServer",
+      "BBF TR-069 management server"
+    ],
+    [
+      341,
+      "GpncPmhd",
+      "GEM port network CTP performance monitoring history data"
+    ],
+    [
+      350,
+      "Me350",
+      "Private ME 350"
+    ],
+    [
+      370,
+      "Me370",
+      "Private ME 370"
+    ],
+    [
+      373,
+      "Me373",
+      "Private ME 373"
+    ],
+    [
+      407,
+      "SipAgentConfigData2",
+      "SIP agent config data 2 (Calix profile)"
+    ],
+    [
+      65280,
+      "CalixVoipCallStatistics",
+      "Calix VoIP call statistics"
+    ],
+    [
+      65281,
+      "CalixVoipCallStatisticsExt2",
+      "Calix VoIP call statistics extension 2"
+    ],
+    [
+      65282,
+      "CalixVoipCallStatisticsExt3",
+      "Calix VoIP call statistics extension 3"
+    ],
+    [
+      65283,
+      "CalixVoipCallStatisticsExt4",
+      "Calix VoIP call statistics extension 4"
+    ],
+    [
+      65294,
+      "PrivateSntp",
+      "Private SNTP"
+    ],
+    [
+      65311,
+      "EthernetUniHCExt",
+      "Calix Ethernet UNI high-capacity counters"
+    ],
+    [
+      65319,
+      "LldpMedControl",
+      "Calix LLDP MED control"
+    ],
+    [
+      65408,
+      "ExtendedOnuG",
+      "Extended ONU-G"
+    ],
+    [
+      65527,
+      "OLTLocationConfigData",
+      "OLT location config data"
+    ],
+    [
+      65528,
+      "CTCOnuOnuLoopDetection",
+      "CTC loop detection"
+    ],
+    [
+      65529,
+      "OnuCapability",
+      "ONU capability"
+    ],
+    [
+      65530,
+      "LoIdAuth",
+      "LOID authentication"
+    ],
+    [
+      65531,
+      "ExtendedMcastOperProf",
+      "Extended multicast operations profile"
+    ],
+    [
+      65534,
+      "PrivateTqCfg",
+      "Private T-CONT queue configuration"
+    ],
+    [
+      65535,
+      "PrivateVlanCfg",
+      "Private VLAN configuration"
+    ]
+  ],
+  "catalog_scope": "Private Calix/E7 compatibility image; no runtime OMCI changes."
+}

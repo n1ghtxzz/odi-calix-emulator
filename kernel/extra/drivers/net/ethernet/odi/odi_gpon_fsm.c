@@ -1,0 +1,661 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * odi_gpon_fsm.c -- implementation of the O1-O7 ONU activation state
+ * machine declared in odi_gpon_fsm.h. Plain C, no kernel dependency.
+ *
+ * Every transition below is cited to ITU-T G.984.3 Table 10-1 (clause
+ * 10.2.4) unless marked otherwise (see docs/REFERENCES.md for the
+ * edition and how to fetch a local copy of the standard) -- the standard
+ * text is the primary source, not the author's own recollection.
+ *
+ * Design notes not repeated at every call site:
+ *
+ * - ONU-ID address filtering for a directed message (checking msg->onu_id
+ *   against the ID this FSM was assigned, or against
+ *   ODI_GPON_ONU_ID_BROADCAST) is applied here, inline, exactly where
+ *   Table 10-1 says "Match ONU-ID?".
+ * - The switch-fabric link_force_up() calls are this driver's own design,
+ *   a step beyond the base standard (forcing the PON port MAC link up
+ *   entering O5, down leaving it) -- G.984.3 itself says nothing about a
+ *   switch fabric, since GEM/T-CONT forwarding is this SoC's own
+ *   architecture, not part of the GTC/PLOAM layer.
+ * - The driver-level ODI_GPON_EVENT_ACTIVATE/_DEACTIVATE commands are not
+ *   G.984.3 events. ACTIVATE is this driver's own full reset to O1.
+ *   DEACTIVATE is implemented as exactly what a Deactivate_ONU-ID PLOAM
+ *   does (clause 9.2.3.5, Table 10-1's own Deactivate row) -- valid only from
+ *   O4/O5/O6, forcing O2, a no-op everywhere else.
+ * - The SN-request and ranging-request "bandwidth-map grant" events
+ *   (Table 10-1's own rows for those, clause 10.2.5.2) are not PLOAM
+ *   messages -- this driver's own FSM event set (odi_gpon_fsm.h) has no
+ *   distinct bandwidth-grant event, so it abstracts both as the synthetic
+ *   ODI_GPON_SN_REQUEST_GRANT message type carried over the ordinary
+ *   ODI_GPON_EVENT_PLOAM_RX event (odi_gpon_ploam.h documents the same
+ *   abstraction at its definition).
+ * - The Ranging_Time message's own 32-bit decoded eqd value is handed to
+ *   ops->set_eqd() raw (bits, MSB first) rather than split here into
+ *   USF_EQ_DELAY's own MULTFRAME/INFRAME fields -- the real split needs a
+ *   USF_MIN_RESP_DELAY register READ (odi_gpon_hw.c's own derived
+ *   formula, confirmed against two activation captures), which this pure
+ *   FSM has no access to; splitting on an unconfirmed fixed bit boundary
+ *   here (an earlier draft of this file did exactly that) would have been
+ *   this author's own guess dressed up as a fact.
+ * - The Serial_Number_ONU reply is NOT sent by this FSM at all, on the
+ *   ODI_GPON_SN_REQUEST_GRANT synthetic event or otherwise: hardware
+ *   sends it autonomously once the real serial number is pre-armed into
+ *   the upstream PLOAM FIFO's own dedicated slot at driver bring-up
+ *   (the `gpondev`/`gponsn` PON steps, odi_gpon_init.c), with zero
+ *   software involvement per grant. ODI_GPON_SN_REQUEST_GRANT
+ *   (odi_gpon_ploam.h) is kept defined for the O3/O4 Table 10-1
+ *   bandwidth-map-grant citation it documents, but this FSM no longer
+ *   dispatches on it.
+ */
+#include "odi_gpon_fsm.h"
+#include "odi_gpon_hw.h"	/* ODI_GPON_DSK_SLOT_NEXT -- a slot id, no register access from here */
+
+#ifdef __KERNEL__
+#include <linux/string.h>
+#else
+#include <string.h>
+#endif
+
+static int odi_gpon_serial_number_eq(const struct odi_gpon_fsm *fsm, const uint8_t sn[8])
+{
+	return memcmp(fsm->serial_number, sn, 8U) == 0;
+}
+
+static int odi_gpon_onu_id_matches(const struct odi_gpon_fsm *fsm, uint8_t onu_id)
+{
+	return onu_id == fsm->onu_id || onu_id == ODI_GPON_ONU_ID_BROADCAST;
+}
+
+static int odi_gpon_fsm_holds_onu_id(const struct odi_gpon_fsm *fsm)
+{
+	return fsm->state == ODI_GPON_STATE_O4 || fsm->state == ODI_GPON_STATE_O5 ||
+	       fsm->state == ODI_GPON_STATE_O6;
+}
+
+/* A directed message is ours only while this ONU holds an ONU-ID, which is
+ * from Assign_ONU-ID (O3 -> O4) until it is discarded (every way out to
+ * O1, O2 or O7): O4, O5 and O6. fsm->onu_id reads 0 both for ONU-ID 0 and
+ * for none, so outside those states a message to ONU 0, another ONU, would
+ * otherwise match, and its Assign_Alloc-ID would arm this ONU's CAM. The
+ * stock module keeps 255, the unassigned ID (G.984.3 Table 5-1), when it
+ * holds none, which no directed message carries.
+ */
+int odi_gpon_fsm_directed_to_us(const struct odi_gpon_fsm *fsm, const struct odi_gpon_ploam *msg)
+{
+	if (!odi_gpon_fsm_holds_onu_id(fsm))
+		return 0;
+	return msg->onu_id != ODI_GPON_ONU_ID_BROADCAST && msg->onu_id == fsm->onu_id;
+}
+
+/* For the messages G.984.3 lets the OLT send to one ONU or to all
+ * (BER_Interval 9.2.3.18, Key_Switching_Time 9.2.3.19, octet 1 "ONU-ID or
+ * 11111111"): ours, or the broadcast copy, and never another ONU's, which
+ * a shared PON also carries to this receiver. Same state gate and same
+ * treatment of ONU-ID 0 as odi_gpon_fsm_directed_to_us().
+ */
+int odi_gpon_fsm_addressed_to_us(const struct odi_gpon_fsm *fsm, const struct odi_gpon_ploam *msg)
+{
+	if (!odi_gpon_fsm_holds_onu_id(fsm))
+		return 0;
+	return msg->onu_id == ODI_GPON_ONU_ID_BROADCAST || msg->onu_id == fsm->onu_id;
+}
+
+/* Stops whatever timer is running for the state being left, if any. Safe
+ * to call from any state.
+ */
+static void odi_gpon_fsm_stop_timers_for_state(const struct odi_gpon_fsm *fsm,
+						const struct odi_gpon_fsm_ops *ops, void *ctx)
+{
+	if (fsm->state == ODI_GPON_STATE_O3 || fsm->state == ODI_GPON_STATE_O4)
+		ops->stop_to1(ctx);
+	else if (fsm->state == ODI_GPON_STATE_O6)
+		ops->stop_to2(ctx);
+}
+
+/* Three copies: G.984.3 has the ONU answer Request_Password with the
+ * Password message three times (9.2.3, Request_Password), and the OLT
+ * takes the password as valid only when it gets three identical ones
+ * (9.2.4, Password). The stock GPON module sends three as well.
+ */
+#define ODI_GPON_PASSWORD_COPIES	3U
+
+static void odi_gpon_fsm_send_password(const struct odi_gpon_fsm *fsm,
+					const struct odi_gpon_fsm_ops *ops, void *ctx)
+{
+	struct odi_gpon_ploam reply;
+	unsigned int i;
+
+	odi_gpon_encode_password(fsm->onu_id, fsm->password, &reply);
+	for (i = 0; i < ODI_GPON_PASSWORD_COPIES; i++)
+		ops->send_us_ploam(ctx, &reply);
+}
+
+/* The ONU-ID this FSM holds (from O4 on) discarded: what Deactivate_ONU-ID
+ * does (clause 9.2.3.5, "Effect of receipt": the ONU-ID, OMCI Port-ID and
+ * Alloc-IDs are discarded), and what every fall from O4, O5 or O6 back to
+ * O1 or O2 implies, since the next ONU-ID comes from a new Assign_ONU-ID in
+ * O3. The leaf (odi_gpon_hw.c, hw_set_onu_id()) also takes down the
+ * Alloc-ID and OMCC port rows tied to it, so the next activation starts
+ * from empty tables. Written as the broadcast ID, see
+ * odi_gpon_fsm_do_activate().
+ */
+static void odi_gpon_fsm_discard_onu_id(struct odi_gpon_fsm *fsm,
+					 const struct odi_gpon_fsm_ops *ops, void *ctx)
+{
+	fsm->onu_id = 0;
+	ops->set_onu_id(ctx, ODI_GPON_ONU_ID_BROADCAST);
+}
+
+/* Back to Initial (O1) after a loss of signal or a TO2 expiry: the laser
+ * gate closes as it does on ACTIVATE, and opens again on the O1 -> O2
+ * PSync row (odi_gpon_fsm_do_los_clear()).
+ */
+static void odi_gpon_fsm_enter_o1(struct odi_gpon_fsm *fsm, const struct odi_gpon_fsm_ops *ops,
+				   void *ctx)
+{
+	ops->laser_enable(ctx, 0);
+	fsm->state = ODI_GPON_STATE_O1;
+	ops->set_state(ctx, ODI_GPON_STATE_O1);
+}
+
+void odi_gpon_fsm_init(struct odi_gpon_fsm *fsm)
+{
+	memset(fsm, 0, sizeof(*fsm));
+	fsm->state = ODI_GPON_STATE_O1;
+}
+
+void odi_gpon_fsm_set_serial_number(struct odi_gpon_fsm *fsm, const uint8_t serial_number[8])
+{
+	memcpy(fsm->serial_number, serial_number, 8U);
+}
+
+void odi_gpon_fsm_set_password(struct odi_gpon_fsm *fsm, const uint8_t password[10])
+{
+	memcpy(fsm->password, password, ODI_GPON_PLOAM_CONTENT_LEN);
+}
+
+/* ---- Event handlers ---- */
+
+/* Driver-level full reset (not itself a G.984.3 event). */
+static void odi_gpon_fsm_do_activate(struct odi_gpon_fsm *fsm, const struct odi_gpon_fsm_ops *ops,
+				      void *ctx)
+{
+	if (fsm->state == ODI_GPON_STATE_O5)
+		ops->link_force_up(ctx, 0);
+	odi_gpon_fsm_stop_timers_for_state(fsm, ops, ctx);
+
+	ops->laser_enable(ctx, 0);
+	fsm->onu_id = 0;
+	/* The wire/register value for "no ONU-ID assigned" is the G.984.3
+	 * broadcast ID (0xff, ODI_GPON_ONU_ID_BROADCAST), confirmed by every
+	 * capture this driver has seen, including boot's own O1 entry -- not
+	 * the field's own zero value, which is this struct's own separate
+	 * "nothing assigned yet" software sentinel, kept as 0 for fsm->onu_id
+	 * itself, not written to hardware.
+	 */
+	ops->set_onu_id(ctx, ODI_GPON_ONU_ID_BROADCAST);
+	fsm->state = ODI_GPON_STATE_O1;
+	ops->set_state(ctx, ODI_GPON_STATE_O1);
+}
+
+/* Deactivate_ONU-ID's own effect (clause 9.2.3.5's own "Effect of receipt":
+ * laser off, ONU-ID/OMCI-Port-ID/Alloc-IDs discarded, => Standby) and
+ * Table 10-1's own Deactivate row (defined only from Ranging/Operation/POPUP
+ * -- O2/O3/O1/O7 are dashes, a no-op). Shared by the PLOAM handler and
+ * the ODI_GPON_EVENT_DEACTIVATE driver command.
+ */
+static void odi_gpon_fsm_apply_deactivate(struct odi_gpon_fsm *fsm,
+					   const struct odi_gpon_fsm_ops *ops, void *ctx)
+{
+	if (fsm->state != ODI_GPON_STATE_O4 && fsm->state != ODI_GPON_STATE_O5 &&
+	    fsm->state != ODI_GPON_STATE_O6)
+		return;
+
+	if (fsm->state == ODI_GPON_STATE_O4)
+		ops->stop_to1(ctx);
+	else if (fsm->state == ODI_GPON_STATE_O5)
+		ops->link_force_up(ctx, 0);
+	else
+		ops->stop_to2(ctx);
+
+	ops->laser_enable(ctx, 0);
+	odi_gpon_fsm_discard_onu_id(fsm, ops, ctx);
+	fsm->state = ODI_GPON_STATE_O2;
+	ops->set_state(ctx, ODI_GPON_STATE_O2);
+}
+
+/* Table 10-1, "Timer TO1 expires" row: Serial_Number(O3) and Ranging(O4)
+ * both => O2. From O4 the ONU-ID assigned in O3 is discarded: the attempt
+ * that got it was abandoned, and the next one starts at Assign_ONU-ID.
+ */
+static void odi_gpon_fsm_do_to1_expire(struct odi_gpon_fsm *fsm, const struct odi_gpon_fsm_ops *ops,
+					void *ctx)
+{
+	if (fsm->state != ODI_GPON_STATE_O3 && fsm->state != ODI_GPON_STATE_O4)
+		return;	/* stale/unrelated expiry, nothing to do */
+
+	ops->stop_to1(ctx);
+	if (fsm->state == ODI_GPON_STATE_O4)
+		odi_gpon_fsm_discard_onu_id(fsm, ops, ctx);
+	fsm->state = ODI_GPON_STATE_O2;
+	ops->set_state(ctx, ODI_GPON_STATE_O2);
+}
+
+/* Table 10-1, "Timer TO2 expires" row: POPUP(O6) => O1 (not O5 -- the ONU
+ * could not reacquire sync in time, so it falls all the way back to
+ * Initial, clause 10.2.2 f)). It ranges again from O2, so the ONU-ID goes.
+ * The port link went down on entering O6 and stays down.
+ */
+static void odi_gpon_fsm_do_to2_expire(struct odi_gpon_fsm *fsm, const struct odi_gpon_fsm_ops *ops,
+					void *ctx)
+{
+	if (fsm->state != ODI_GPON_STATE_O6)
+		return;
+
+	ops->stop_to2(ctx);
+	odi_gpon_fsm_discard_onu_id(fsm, ops, ctx);
+	odi_gpon_fsm_enter_o1(fsm, ops, ctx);
+}
+
+/* Table 10-1, "ONU detects LOS or LOF" row: Standby(O2) => O1;
+ * Serial_Number(O3) stops TO1 => O1; Ranging(O4) stops TO1 => O1, its
+ * ONU-ID discarded; Operation(O5) ceases upstream tx, starts TO2, => O6.
+ * O1/O6/O7 are dashes (O6's own LOS handling is the PSync-recovery row
+ * instead, see odi_gpon_fsm_do_los_clear()).
+ *
+ * "Ceases upstream transmission" is the O6 state write: with the light or
+ * the framing gone there is no bandwidth map, so no grant to answer.
+ * Whether the MAC also refuses a grant on the O6 state alone, once the
+ * light is back and before TO2 runs out, is not decoded, and neither is
+ * any register that gates the transmitter by itself (laser_enable() is a
+ * no-op leaf, odi_gpon_hw.c). The port link goes down too, so the switch
+ * stops queueing frames for the PON while nothing can carry them.
+ */
+static void odi_gpon_fsm_do_los(struct odi_gpon_fsm *fsm, const struct odi_gpon_fsm_ops *ops,
+				 void *ctx)
+{
+	switch (fsm->state) {
+	case ODI_GPON_STATE_O2:
+		odi_gpon_fsm_enter_o1(fsm, ops, ctx);
+		break;
+	case ODI_GPON_STATE_O3:
+		ops->stop_to1(ctx);
+		odi_gpon_fsm_enter_o1(fsm, ops, ctx);
+		break;
+	case ODI_GPON_STATE_O4:
+		ops->stop_to1(ctx);
+		odi_gpon_fsm_discard_onu_id(fsm, ops, ctx);
+		odi_gpon_fsm_enter_o1(fsm, ops, ctx);
+		break;
+	case ODI_GPON_STATE_O5:
+		ops->link_force_up(ctx, 0);
+		ops->start_to2(ctx);
+		fsm->state = ODI_GPON_STATE_O6;
+		ops->set_state(ctx, ODI_GPON_STATE_O6);
+		break;
+	case ODI_GPON_STATE_O1:
+	case ODI_GPON_STATE_O6:
+	case ODI_GPON_STATE_O7:
+		break;	/* dashes in Table 10-1 */
+	}
+}
+
+/* Table 10-1, "ONU achieves PSync synchronization" row: Init(O1) clears
+ * LOS/LOF => O2; POPUP(O6) remains in O6 (resumes PCBd processing, per
+ * clause 10.2.2 f) a no-op transition rather than a distinct target
+ * state -- O6 has its own separate LOS-clear handling, distinct from O1
+ * own handling above). All other states are dashes.
+ */
+static void odi_gpon_fsm_do_los_clear(struct odi_gpon_fsm *fsm, const struct odi_gpon_fsm_ops *ops,
+				       void *ctx)
+{
+	if (fsm->state != ODI_GPON_STATE_O1)
+		return;	/* O6: no-op by design (see comment above); everything else: dash */
+
+	ops->laser_enable(ctx, 1);
+	fsm->state = ODI_GPON_STATE_O2;
+	ops->set_state(ctx, ODI_GPON_STATE_O2);
+}
+
+/* Table 10-1, Disable_Serial_Number rows (clause 9.2.3.6's own content
+ * codes: 0xFF disable, 0x00 enable, 0x0F enable-all). "disable" applies
+ * from Standby/Serial_Number/Ranging/Operation/POPUP (O2-O6), matching
+ * serial number, and stops whatever timer that state was running before
+ * moving to Emergency Stop (O7) and shutting the laser off. "enable"
+ * applies only from Emergency Stop (O7), moving to Standby (O2, "All
+ * parameters ... are re-examined", clause 10.2.2 g)) and turning the
+ * laser back on. ODI_GPON_DISABLE_SN_ENABLE_ALL (0x0F) re-enables every
+ * ONU that was denied upstream access, whatever the serial number bytes
+ * say (clause 9.2.3.6: "The content of bytes 4-11 is irrelevant"), so from
+ * O7 it is the same enable, with no serial number to match.
+ * Returns 1 if this message was recognized (caller should not fall
+ * through to per-state dispatch), 0 otherwise.
+ */
+static int odi_gpon_fsm_handle_disable_sn(struct odi_gpon_fsm *fsm,
+					   const struct odi_gpon_fsm_ops *ops, void *ctx,
+					   const struct odi_gpon_ploam *msg)
+{
+	struct odi_gpon_ds_disable_serial_number dsn;
+
+	if (msg->type != ODI_GPON_DS_DISABLE_SERIAL_NUMBER &&
+	    msg->type != ODI_GPON_DS_DISABLE_SERIAL_NUMBER_VS)
+		return 0;
+
+	odi_gpon_decode_disable_serial_number(msg, &dsn);
+
+	if (dsn.code == ODI_GPON_DISABLE_SN_DISABLE) {
+		if (fsm->state == ODI_GPON_STATE_O1 || fsm->state == ODI_GPON_STATE_O7)
+			return 1;	/* dashes in Table 10-1 */
+		if (!odi_gpon_serial_number_eq(fsm, dsn.serial_number))
+			return 1;	/* addressed to a different ONU */
+
+		if (fsm->state == ODI_GPON_STATE_O5)
+			ops->link_force_up(ctx, 0);
+		odi_gpon_fsm_stop_timers_for_state(fsm, ops, ctx);
+		ops->laser_enable(ctx, 0);
+		/* Re-enable "re-examines" every parameter, the ONU-ID
+		 * included (clause 10.2.2 g)): the one held from O4 on goes.
+		 */
+		if (fsm->state == ODI_GPON_STATE_O4 || fsm->state == ODI_GPON_STATE_O5 ||
+		    fsm->state == ODI_GPON_STATE_O6)
+			odi_gpon_fsm_discard_onu_id(fsm, ops, ctx);
+		fsm->state = ODI_GPON_STATE_O7;
+		ops->set_state(ctx, ODI_GPON_STATE_O7);
+	} else if (dsn.code == ODI_GPON_DISABLE_SN_ENABLE ||
+		   dsn.code == ODI_GPON_DISABLE_SN_ENABLE_ALL) {
+		if (fsm->state != ODI_GPON_STATE_O7)
+			return 1;	/* "enable" is only defined from Emergency Stop */
+		if (dsn.code == ODI_GPON_DISABLE_SN_ENABLE &&
+		    !odi_gpon_serial_number_eq(fsm, dsn.serial_number))
+			return 1;
+
+		ops->laser_enable(ctx, 1);
+		fsm->state = ODI_GPON_STATE_O2;
+		ops->set_state(ctx, ODI_GPON_STATE_O2);
+	}
+	return 1;
+}
+
+static void odi_gpon_fsm_do_ploam_rx(struct odi_gpon_fsm *fsm, const struct odi_gpon_fsm_ops *ops,
+				      void *ctx, const struct odi_gpon_ploam *msg)
+{
+	struct odi_gpon_ds_upstream_overhead boh;
+	struct odi_gpon_ds_assign_onu_id assign;
+	struct odi_gpon_ds_ranging_time ranging;
+	struct odi_gpon_ds_key_switching_time kst;
+	struct odi_gpon_ploam reply;
+	unsigned int i, rep;
+
+	if (odi_gpon_fsm_handle_disable_sn(fsm, ops, ctx, msg))
+		return;
+
+	if (msg->type == ODI_GPON_DS_DEACTIVATE_ONU_ID) {
+		if (odi_gpon_onu_id_matches(fsm, msg->onu_id))
+			odi_gpon_fsm_apply_deactivate(fsm, ops, ctx);
+		return;
+	}
+
+	switch (fsm->state) {
+	case ODI_GPON_STATE_O1:
+	case ODI_GPON_STATE_O7:
+		break;	/* no PLOAM expected/acted on in these states beyond disable/enable above */
+
+	case ODI_GPON_STATE_O2:
+		if (msg->type == ODI_GPON_DS_UPSTREAM_OVERHEAD) {
+			odi_gpon_decode_upstream_overhead(msg, &boh);
+			/* G.984.3 9.2.3.1: the pre-assigned delay applies only
+			 * when the e flag is set; otherwise the field is not
+			 * meaningful and the ONU starts from a zero delay.
+			 */
+			fsm->preassigned_delay = boh.preassigned_delay_en ? boh.preassigned_delay : 0U;
+			ops->set_upstream_overhead(ctx, boh.guard_bits, boh.type1_preamble_bits,
+						    boh.type2_preamble_bits, boh.type3_pattern,
+						    boh.delimiter, fsm->preassigned_delay,
+						    boh.power_level_mode);
+			ops->start_to1(ctx);
+			fsm->state = ODI_GPON_STATE_O3;
+			ops->set_state(ctx, ODI_GPON_STATE_O3);
+		}
+		break;
+
+	case ODI_GPON_STATE_O3:
+		/* No case for ODI_GPON_SN_REQUEST_GRANT here (see this file's own
+		 * header comment): hardware answers the SN-request grant on
+		 * its own, from the FIFO slot armed at bring-up.
+		 */
+		if (msg->type == ODI_GPON_DS_ASSIGN_ONU_ID) {
+			odi_gpon_decode_assign_onu_id(msg, &assign);
+			if (!odi_gpon_serial_number_eq(fsm, assign.serial_number))
+				break;	/* addressed to a different ONU */
+			fsm->onu_id = assign.onu_id;
+			ops->set_onu_id(ctx, assign.onu_id);
+			fsm->state = ODI_GPON_STATE_O4;
+			ops->set_state(ctx, ODI_GPON_STATE_O4);
+		}
+		break;
+
+	case ODI_GPON_STATE_O4:
+		/* No case for ODI_GPON_SN_REQUEST_GRANT here either, same
+		 * reason as O3 above. Ranging_Time and Request_Password are
+		 * directed messages: the EqD is taken only from ours (clause
+		 * 10.2.5.1 d)).
+		 */
+		if (!odi_gpon_fsm_directed_to_us(fsm, msg))
+			break;
+		if (msg->type == ODI_GPON_DS_RANGING_TIME) {
+			odi_gpon_decode_ranging_time(msg, &ranging);
+			/* G.984.3 9.2.3.4: with the protection path bit set the
+			 * message carries the EqD of the protection path, which
+			 * is not the path this ONU ranged on. Applying it would
+			 * mis-time every burst, so it is ignored: no EqD write,
+			 * no state change. The OLT sends the main path message
+			 * separately.
+			 */
+			if (ranging.protection_path)
+				break;
+			/* This driver's own O4->O5 sequence: stop TO1, apply
+			 * EqD, flush the pre-ranging US PLOAM buffer, set
+			 * state, then force the port link up.
+			 */
+			ops->stop_to1(ctx);
+			ops->set_eqd(ctx, ranging.eqd);
+			ops->flush_us_ploam_buf(ctx);
+			fsm->state = ODI_GPON_STATE_O5;
+			ops->set_state(ctx, ODI_GPON_STATE_O5);
+			ops->link_force_up(ctx, 1);
+		} else if (msg->type == ODI_GPON_DS_REQUEST_PASSWORD) {
+			odi_gpon_fsm_send_password(fsm, ops, ctx);
+		}
+		break;
+
+	case ODI_GPON_STATE_O5:
+		if (msg->type == ODI_GPON_DS_REQUEST_KEY && odi_gpon_fsm_directed_to_us(fsm, msg)) {
+			/* G.984.3 clause 12.3: a new key for every request, with
+			 * a new Key_Index, and a new request before the switch
+			 * replaces the key still waiting in the shadow slot
+			 * (clause 12.4). Both fragments, each sent 3x,
+			 * alternating (0,1,0,1,0,1), not 3 of fragment 0
+			 * followed by 3 of fragment 1. The same key is loaded
+			 * into the inactive hardware slot after all six sends.
+			 */
+			ops->new_key(ctx, fsm->aes_key);
+			fsm->key_index++;
+			for (rep = 0; rep < 3U; rep++) {
+				for (i = 0; i < ODI_GPON_KEY_FRAGMENTS; i++) {
+					odi_gpon_encode_encryption_key_fragment(fsm->onu_id,
+										 fsm->key_index,
+										 fsm->aes_key, i,
+										 &reply);
+					ops->send_us_ploam(ctx, &reply);
+				}
+			}
+			ops->load_key(ctx, ODI_GPON_DSK_SLOT_NEXT, fsm->aes_key);
+		} else if (msg->type == ODI_GPON_DS_KEY_SWITCHING_TIME &&
+			   odi_gpon_fsm_addressed_to_us(fsm, msg)) {
+			odi_gpon_decode_key_switching_time(msg, &kst);
+			ops->switch_key(ctx, kst.switch_superframe);
+		} else if (msg->type == ODI_GPON_DS_REQUEST_PASSWORD &&
+			   odi_gpon_fsm_directed_to_us(fsm, msg)) {
+			odi_gpon_fsm_send_password(fsm, ops, ctx);
+		}
+		/* Encrypted_Port-ID, Configure_Port-ID, Assign_Alloc-ID,
+		 * BER_interval, Change_Power_Level and the rest are GEM/
+		 * T-CONT/alarm/power-level programming, not an FSM state
+		 * concern -- not handled here by design. POPUP has no
+		 * defined effect from Operation per Table 10-1 (LOS/LOF, not
+		 * a PLOAM, is what enters O6).
+		 */
+		break;
+
+	case ODI_GPON_STATE_O6:
+		if (msg->type == ODI_GPON_DS_POPUP) {
+			if (msg->onu_id == ODI_GPON_ONU_ID_BROADCAST) {
+				/* Ranged again from O4, so with the pre-ranged
+				 * burst and the pre-assigned delay, not the EqD
+				 * of the old ranging (set_preranged()). The
+				 * ONU-ID stays: the OLT ranges the ONU it knows.
+				 */
+				ops->stop_to2(ctx);
+				ops->set_preranged(ctx, fsm->preassigned_delay);
+				ops->start_to1(ctx);
+				fsm->state = ODI_GPON_STATE_O4;
+				ops->set_state(ctx, ODI_GPON_STATE_O4);
+			} else if (msg->onu_id == fsm->onu_id) {
+				/* Back to Operation with everything O5 had: the
+				 * link that entering O6 forced down comes back up,
+				 * in the O4 -> O5 order (state, then link).
+				 */
+				ops->stop_to2(ctx);
+				fsm->state = ODI_GPON_STATE_O5;
+				ops->set_state(ctx, ODI_GPON_STATE_O5);
+				ops->link_force_up(ctx, 1);
+			}
+		}
+		break;
+	}
+}
+
+/* The downstream message that can move the FSM, named for the log line.
+ * Only the types Table 10-1 acts on are named; every other type is
+ * GEM/T-CONT/key programming that never changes state.
+ */
+static const char *odi_gpon_fsm_ploam_cause(const struct odi_gpon_ploam *msg)
+{
+	struct odi_gpon_ds_disable_serial_number dsn;
+
+	if (!msg)
+		return "ploam_unknown";
+	switch (msg->type) {
+	case ODI_GPON_DS_UPSTREAM_OVERHEAD:
+		return "upstream_overhead";
+	case ODI_GPON_DS_ASSIGN_ONU_ID:
+		return "assign_onu_id";
+	case ODI_GPON_DS_RANGING_TIME:
+		return "ranging_time";
+	case ODI_GPON_DS_DEACTIVATE_ONU_ID:
+		return "deactivate_onu_id";
+	case ODI_GPON_DS_POPUP:
+		return "popup";
+	case ODI_GPON_DS_DISABLE_SERIAL_NUMBER:
+	case ODI_GPON_DS_DISABLE_SERIAL_NUMBER_VS:
+		odi_gpon_decode_disable_serial_number(msg, &dsn);
+		if (dsn.code == ODI_GPON_DISABLE_SN_DISABLE)
+			return "disable_serial_number";
+		if (dsn.code == ODI_GPON_DISABLE_SN_ENABLE)
+			return "enable_serial_number";
+		return "enable_all_serial_numbers";
+	default:
+		return "ploam_other";
+	}
+}
+
+void odi_gpon_fsm_cause(enum odi_gpon_event event, const struct odi_gpon_ploam *msg,
+			struct odi_gpon_fsm_cause *out)
+{
+	out->name = "unknown";
+	out->side = "unknown";
+	switch (event) {
+	case ODI_GPON_EVENT_ACTIVATE:
+		out->name = "activate";
+		out->side = "local";
+		break;
+	case ODI_GPON_EVENT_DEACTIVATE:
+		out->name = "deactivate";
+		out->side = "local";
+		break;
+	case ODI_GPON_EVENT_TO1_EXPIRE:
+		out->name = "to1_expired";
+		out->side = "timer";
+		break;
+	case ODI_GPON_EVENT_TO2_EXPIRE:
+		out->name = "to2_expired";
+		out->side = "timer";
+		break;
+	case ODI_GPON_EVENT_LOS:
+		out->name = "los";
+		out->side = "line";
+		break;
+	case ODI_GPON_EVENT_LOS_CLEAR:
+		out->name = "los_cleared";
+		out->side = "line";
+		break;
+	case ODI_GPON_EVENT_PLOAM_RX:
+		out->name = odi_gpon_fsm_ploam_cause(msg);
+		out->side = "olt";
+		break;
+	}
+}
+
+int odi_gpon_fsm_line_event(const struct odi_gpon_fsm *fsm, int alarm, enum odi_gpon_event *event)
+{
+	switch (fsm->state) {
+	case ODI_GPON_STATE_O1:
+		if (alarm)
+			return 0;
+		*event = ODI_GPON_EVENT_LOS_CLEAR;
+		return 1;
+	case ODI_GPON_STATE_O2:
+	case ODI_GPON_STATE_O3:
+	case ODI_GPON_STATE_O4:
+	case ODI_GPON_STATE_O5:
+		if (!alarm)
+			return 0;
+		*event = ODI_GPON_EVENT_LOS;
+		return 1;
+	case ODI_GPON_STATE_O6:
+	case ODI_GPON_STATE_O7:
+		break;
+	}
+	return 0;
+}
+
+void odi_gpon_fsm_handle_event(struct odi_gpon_fsm *fsm, const struct odi_gpon_fsm_ops *ops,
+				void *ctx, enum odi_gpon_event event,
+				const struct odi_gpon_ploam *msg)
+{
+	switch (event) {
+	case ODI_GPON_EVENT_ACTIVATE:
+		odi_gpon_fsm_do_activate(fsm, ops, ctx);
+		break;
+	case ODI_GPON_EVENT_DEACTIVATE:
+		odi_gpon_fsm_apply_deactivate(fsm, ops, ctx);
+		break;
+	case ODI_GPON_EVENT_TO1_EXPIRE:
+		odi_gpon_fsm_do_to1_expire(fsm, ops, ctx);
+		break;
+	case ODI_GPON_EVENT_TO2_EXPIRE:
+		odi_gpon_fsm_do_to2_expire(fsm, ops, ctx);
+		break;
+	case ODI_GPON_EVENT_LOS:
+		odi_gpon_fsm_do_los(fsm, ops, ctx);
+		break;
+	case ODI_GPON_EVENT_LOS_CLEAR:
+		odi_gpon_fsm_do_los_clear(fsm, ops, ctx);
+		break;
+	case ODI_GPON_EVENT_PLOAM_RX:
+		odi_gpon_fsm_do_ploam_rx(fsm, ops, ctx, msg);
+		break;
+	}
+}

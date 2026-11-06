@@ -1,0 +1,108 @@
+#!/bin/sh
+#
+# /etc/init.d/services -- manual control over syslogd, klogd, ntpd,
+# metricsd, confd, dropbear and omcid. Since v1.0.4 each is its own
+# `respawn` entry in /etc/inittab
+# (docs/SETTINGS.md, "native over hand-rolled"): init starts all right
+# after rcS (sysinit) returns and restarts whichever one exits, forever, on
+# its own -- there is no boot-time "start" step here any more. This script
+# is now only a hand tool for stopping or restarting one at the prompt.
+#
+# stop <name>: writes /etc/config/<name>.off (jffs2, survives a reflash;
+# needs the config partition mounted) and kills the running process. Its
+# svc-<name>.sh entry (rootfs/skeleton/etc/scripts/) checks the flag on
+# every exec, so the very next respawn -- immediate, since killing it IS
+# what triggers that respawn -- execs the placeholder instead of the
+# daemon; init keeps "respawning" that harmlessly forever.
+# start <name>: removes the flag and kills whatever is currently running
+# under that entry (the daemon already, or the placeholder), so init
+# restarts it at once, into the daemon this time. No `kill -HUP 1` and no
+# reboot needed either way.
+#
+# omcid is also a watchdog client (rcS registers it with a 60 s ping
+# deadline, docs/SETTINGS.md "Watchdog rules"): stopping it without
+# releasing that deadline resets the stick a minute later. So `stop omcid`
+# re-registers it with deadline 0, which frees the client (odi_wdt.c
+# client_find skips a zero deadline), and `start omcid` registers it again
+# before killing the placeholder; the deadline counts from that moment and
+# omcid pings within 15 s of starting.
+set -u
+OMCID_DEADLINE_S=${ODI_WDT_OMCID_DEADLINE_S:-60}
+WDT_REGISTER=${WDT_REGISTER:-/proc/odi_wdt/register}
+CONFIG_DIR=${CONFIG_DIR:-/etc/config}
+
+# Writes "omcid <deadline>" to the watchdog, when there is one; bounded,
+# since a /proc write that blocks would hang the prompt.
+wdt_omcid() {
+	[ -w "$WDT_REGISTER" ] || return 0
+	timeout 5 sh -c 'echo "omcid $1" > "$2"' sh "$1" "$WDT_REGISTER" 2>/dev/null ||
+		echo "$0: could not set the omcid watchdog deadline to $1" >&2
+}
+
+usage() {
+	echo "usage: $0 {stop|start} {syslogd|klogd|ntpd|metricsd|confd|dropbear|omcid}" >&2
+	exit 1
+}
+
+svc_comm() {
+	case "$1" in
+	syslogd) echo syslogd ;;
+	klogd) echo klogd ;;
+	ntpd) echo ntpd ;;
+	metricsd) echo metricsd ;;
+	confd) echo confd ;;
+	dropbear) echo dropbear ;;
+	omcid) echo omcid ;;
+	*) echo "" ;;
+	esac
+}
+
+# Kills every process whose /proc/<pid>/comm is exactly $1: the daemon
+# itself once respawn.sh has exec-ed into it (comm becomes the daemon own
+# name), never anything else on this image.
+kill_by_comm() {
+	for p in /proc/[0-9]*; do
+		[ "$(cat "$p/comm" 2>/dev/null)" = "$1" ] && kill -9 "${p#/proc/}" 2>/dev/null
+	done
+}
+
+# Kills every process whose cmdline mentions $1: used to reach the
+# respawn-off.sh placeholder, which always execs with its own path as
+# argv0 and matches nothing else running on this image.
+kill_by_cmdline() {
+	for p in /proc/[0-9]*; do
+		tr '\0' ' ' < "$p/cmdline" 2>/dev/null | grep -q "$1" && kill -9 "${p#/proc/}" 2>/dev/null
+	done
+}
+
+[ $# -eq 2 ] || usage
+action=$1
+svc=$2
+comm=$(svc_comm "$svc")
+[ -n "$comm" ] || usage
+
+case "$action" in
+stop)
+	mkdir -p "$CONFIG_DIR" 2>/dev/null
+	: > "$CONFIG_DIR/$svc.off" 2>/dev/null ||
+		echo "$0: could not write $CONFIG_DIR/$svc.off -- config partition mounted?" >&2
+	[ "$svc" = omcid ] && wdt_omcid 0
+	kill_by_comm "$comm"
+	echo "$svc: stopped ($svc.off written; $0 start $svc, or a reboot without the flag, brings it back)"
+	;;
+start)
+	rm -f "$CONFIG_DIR/$svc.off" 2>/dev/null
+	[ "$svc" = omcid ] && wdt_omcid "$OMCID_DEADLINE_S"
+	kill_by_comm "$comm"
+	# The placeholder (respawn-off.sh) always execs under that same path
+	# regardless of which .off entry launched it, so this can also kill an
+	# unrelated stopped services placeholder -- harmless: init just
+	# restarts it, its own .off flag is unchanged, and it goes straight
+	# back to waiting.
+	kill_by_cmdline "respawn-off.sh"
+	echo "$svc: start requested (flag cleared, current process killed so init restarts it)"
+	;;
+*)
+	usage
+	;;
+esac

@@ -1,0 +1,93 @@
+pon get transceiver bias-current
+pon get transceiver rx-power
+pon get transceiver tx-power
+pon get transceiver temperature
+pon get transceiver voltage
+gpon get onu-state
+gpon get alarm-status
+mib dump counter port all
+exit
+pon get transceiver vendor-name
+pon get transceiver part-number
+pon get transceiver all
+pon get transc rx-power
+p g t r
+pon get transceiver r
+pon get transceiver t
+pon get transceiver tx
+pon get transceiver te
+pon get transceiver
+pon get nonsense
+pon get transceiver rx-power extra
+gpon get flows
+gpon g f
+gpon g flow-c
+gpon get flow-counters
+gpon get flow
+gpon get flows extra
+gpon get o
+mib dump counter port 2
+mib dump counter port 0,2-3
+mib dump counter port 32
+mib dump counter port 3-1
+mib dump counter port x
+register get 0x701008 1
+register get 0 4
+register get 0x214
+register set 0x48 0x08082001
+register set 0x48 4294967295
+register set 0x48 4294967296
+register set 0x48 0xzz
+reg g 0x1d0 1
+help
+e
+vlan get entry 1
+   
+? 
+? pon
+? pon get transceiver 
+? pon get transceiver t
+? gpon get
+? register get 
+? nothing
+l2-table get all
+l2-table get entry address valid
+l2-table g e a v
+l2-table get index 0x3ff
+l2-table get index
+l2-table get
+? l2-table
+? l2-table get e
+pon get transceiver mon
+pon get transceiver limits
+pon get transceiver l
+pon get transceiver m
+acl-probe count 0 port 2 proto 2
+acl-probe count 1 port 0 group 0xefff4d01 32
+acl-probe bytes 2 port 2 group 0xe0000000 4
+acl-probe bytes 3 port 0 proto 2
+acl-probe mirror 4 igmp
+acl-probe trap 5 igmp
+acl-probe trap 5 igmp bytes
+acl-probe mirror 4 igmp b
+acl-probe show 5
+acl-probe delete 5
+acl-probe delete all
+acl-probe d a
+acl-probe count 0 port 2
+acl-probe count 0 port 2 group 0xe0000000
+acl-probe trap 1
+? acl-probe
+mc-count frames 0 pon mac 0x3333 0x00000001 48
+mc-count bytes 3 uni mac 0x0100 0x5e7f4d01 48
+mc-count f 1 p m 0x3333 0 16
+mc-count frames 2 pon ipv4 0xe0000000 4
+mc-count bytes 15 uni ipv4 0xefff4d01 32
+mc-count show 3
+mc-count delete 3
+mc-count delete all
+mc-count frames 0 pon mac 0x3333 0x00000001
+mc-count frames 0 pon
+mc-count frames 0 wan mac 1 2 3
+? mc-count
+? acl-probe delete 

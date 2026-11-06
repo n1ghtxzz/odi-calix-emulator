@@ -1,0 +1,248 @@
+/* SPDX-License-Identifier: GPL-2.0 */
+/*
+ * odi_gpon_drv.h -- what odi_gpon.c calls in the host-testable GPON core:
+ * the FSM ops table bound to the register leaves (odi_gpon_hw.c), the
+ * gponact/gpondeact verbs (local state changes, not G.984.3 messages), the
+ * ISR poll and switch interrupt line (odi_gpon_isr.c), and status getters.
+ *
+ * The caller owns the struct odi_gpon_fsm. odi_gpon_hw.c keeps only
+ * hardware-shadow bookkeeping (CAM rows, burst overhead, counters).
+ */
+#ifndef ODI_GPON_DRV_H
+#define ODI_GPON_DRV_H
+
+#include "odi_gpon_fsm.h"
+
+/* The ops table for odi_gpon_fsm_handle_event(), bound to the
+ * odi_gpon_hw.c register leaves.
+ */
+const struct odi_gpon_fsm_ops *odi_gpon_hw_ops(void);
+
+/* gponact after the first one: re-activation after a gpondeact.
+ * ODI_GPON_EVENT_ACTIVATE (-> O1) and ODI_GPON_EVENT_LOS_CLEAR (-> O2; LOS
+ * is already clear when this verb runs), then AES current-slot zero,
+ * key-switch-time clear and the DS/US interrupt-mask ramps, in the order of
+ * the re-activation capture (test/fixtures/gpon-react-260922-excerpt.txt).
+ * The first gponact replays gpon_init.bin instead (odi_gpon_init.h).
+ */
+void odi_gpon_verb_activate(struct odi_gpon_fsm *fsm);
+
+/* gpondeact verb: administrative force-deactivate straight to O1, not the
+ * O2 a Deactivate_ONU-ID PLOAM produces (ODI_GPON_EVENT_DEACTIVATE).
+ * Interrupt-mask bracket, state -> state + 1 -> O1 as captured, every
+ * allocated Alloc-ID CAM row and GEM port row 64 deleted, the stream-valid
+ * gate cleared, ONU-ID reset to broadcast in both directions.
+ */
+void odi_gpon_verb_deactivate(struct odi_gpon_fsm *fsm);
+
+/* The status words odi_gpon_isr_poll() read, for the /proc/odi_gpon/status
+ * interrupt counters. ds_dlt/us_sts are 0 when top_sts did not flag that
+ * sub-block, which is then not read.
+ */
+struct odi_gpon_isr_poll_status {
+	uint32_t top_sts;	/* PONMAC_IRQ_PENDING (0x700044) */
+	uint32_t ds_dlt;	/* DSF_IRQ_EVENT (0x701000), or 0 */
+	uint32_t us_sts;	/* USF_IRQ_EVENT (0x705000), or 0 */
+};
+
+/* GPON block ISR body (G.984.3 clause 5.8): masks PONMAC_IRQ_ENABLE, reads
+ * PONMAC_IRQ_PENDING, drains every queued downstream PLOAM message until
+ * the FIFO reads empty (at most 16 per call) and dispatches each in turn
+ * (FSM, then Acknowledge/GEM-port/Alloc-ID handling), acks the upstream
+ * sub-block, restores the mask. Returns the number of messages drained.
+ * status may be NULL; otherwise it is filled on every call.
+ */
+unsigned int odi_gpon_isr_poll(struct odi_gpon_fsm *fsm, struct odi_gpon_isr_poll_status *status);
+
+/* Called by odi_gpon_isr_poll() after each message it dispatched, with the
+ * FSM state before that message and the message: odi_gpon.c logs the
+ * transition it caused and re-arms the timers per message, since one call
+ * can move the FSM several times. Called with the caller's lock held; NULL
+ * (the default) calls nothing.
+ */
+typedef void (*odi_gpon_isr_msg_fn)(enum odi_gpon_state prev, const struct odi_gpon_ploam *msg);
+void odi_gpon_isr_set_msg_hook(odi_gpon_isr_msg_fn fn);
+
+/* The downstream line alarm, sampled: DSF_ALARM_STATE (0x701008) read once
+ * and its LOS and LOF bits fed to the FSM as one level
+ * (odi_gpon_fsm_line_event()), from the interrupt and from odi_gpon.c own
+ * timers. watch is 0 until gponact and after gpondeact: the line is then
+ * only read, so an ONU this side stopped stays in O1 whatever the light
+ * does. out->alarms is the register as read (LOM and FEC included, for
+ * the event=los/lof lines); out->fed says whether an FSM event ran, and
+ * then out->event is that event and out->cause its name for the
+ * event=onu_state line: "los" (LOS set), "lof" (LOF alone) or
+ * "los_cleared" (both clear). A MAC that is not clocked answers
+ * ODI_GPON_NO_RESPONSE, which has LOS and LOF set: that reading sets
+ * out->dark and feeds nothing.
+ */
+struct odi_gpon_line_sample {
+	uint32_t alarms;
+	int dark;		/* the register read ODI_GPON_NO_RESPONSE: not a sample, never fed */
+	int fed;
+	enum odi_gpon_event event;
+	const char *cause;
+};
+void odi_gpon_line_sample(struct odi_gpon_fsm *fsm, int watch, struct odi_gpon_line_sample *out);
+
+/* The switch interrupt line (IRQ 8, "apl_sw"), whose one consumer is the
+ * GPON block: CHIP_IRQ_* in odi_switch_hw.h.
+ *
+ * odi_gpon_chip_irq_reset(): polarity high, every source masked, every
+ * latched status cleared, as the stock intr and irq steps do; at boot,
+ * before the line is requested.
+ *
+ * odi_gpon_chip_irq_enable(): unmasks the GPON source, a read-modify-write
+ * of CHIP_IRQ_ENABLE: the acl sdkinit replay has written the whole
+ * register (0x80, the ACL source) before gpondrv, and it must stay.
+ *
+ * odi_gpon_chip_irq_demux(): the handler body. For every source pending
+ * and enabled, in bit order: the GPON one calls gpon(), and each is acked
+ * (write 1 to clear), serviced or not. The ACL source
+ * is enabled by the acl replay with nothing to service it, and a source
+ * left pending holds the level-triggered line up: an interrupt storm.
+ * Returns the bits it acked; 0 is a spurious interrupt.
+ */
+void odi_gpon_chip_irq_reset(void);
+void odi_gpon_chip_irq_enable(void);
+uint32_t odi_gpon_chip_irq_demux(void (*gpon)(void));
+
+/* The USF_EQ_DELAY fields last written (hw_apply_eqd() in odi_gpon_hw.c);
+ * 0/0 before the first Upstream_Overhead.
+ */
+void odi_gpon_get_eqd(uint32_t *multframe, uint32_t *inframe);
+
+/* What the last Ranging_Time-driven USF_EQ_DELAY write used and wrote, for
+ * /proc/odi_gpon/status (debug only): the delay bits the message carried, the
+ * USF_MIN_RESP_DELAY value read at that moment, and the MULTFRAME/INFRAME
+ * written. valid is 0 until the first one.
+ */
+struct odi_gpon_ranging_dbg {
+	uint32_t valid;
+	uint32_t eqd_bits;
+	uint32_t min_resp_delay;
+	uint32_t multframe;
+	uint32_t inframe;
+};
+void odi_gpon_get_ranging_dbg(struct odi_gpon_ranging_dbg *out);
+
+/* PLOAM totals: rx drained by odi_gpon_isr_poll(), tx sent upstream. */
+void odi_gpon_get_ploam_counts(unsigned int *rx, unsigned int *tx);
+
+/* Upstream PLOAM messages not sent because the upstream queue stayed full
+ * for the whole bounded wait; not counted in tx.
+ */
+unsigned int odi_gpon_get_ploam_us_dropped(void);
+
+/* The Alloc-IDs the OLT assigned by Assign_Alloc-ID PLOAM and this driver
+ * wrote into the CAM, in row order, at most `max` of them; the default
+ * (OMCC) row, which carries the ONU-ID, is left out. Row order is the
+ * assignment order, except that a row a deallocation freed is reused first.
+ * Returns the count.
+ * For the alloc_ids line of /proc/odi_gpon/status: the T-CONTs the ISP gave
+ * this ONU.
+ */
+unsigned int odi_gpon_get_alloc_ids(uint16_t *out, unsigned int max);
+
+/* ---- odi_gpon_hw.c leaves the PLOAM dispatch in odi_gpon_isr.c calls
+ * directly, for the message types outside the FSM (Acknowledge, GEM port,
+ * Alloc-ID). odi_gpon_hw_test_seed_active() and
+ * odi_gpon_hw_test_set_key_source() are host-build only.
+ */
+void odi_gpon_hw_reset(void);
+void odi_gpon_hw_test_seed_active(uint16_t gem_port_id, const unsigned int *alloc_rows,
+				   unsigned int n_alloc_rows);
+void odi_gpon_hw_test_set_key_source(void (*fn)(uint8_t key[16]));
+void odi_gpon_hw_note_ploam_rx(const struct odi_gpon_ploam *msg);
+void odi_gpon_hw_ack_send(uint8_t onu_id, const struct odi_gpon_ploam *acked);
+void odi_gpon_hw_gem_port_configure(uint16_t gem_port_id, int activate);
+int odi_gpon_hw_gem_port_encrypted(uint16_t gem_port_id, int encrypted);
+int odi_gpon_hw_alloc_id_find(uint16_t alloc_id);
+void odi_gpon_hw_alloc_cam_read(int hw[32], int recorded[32]);
+/* GEM port CAM rows 0..64: the port each holds (-1 none, -2 the read did
+ * not complete) and its flow type FLAGS. */
+#define ODI_GPON_HW_GEM_CAM_ROWS	65U
+void odi_gpon_hw_gem_cam_read(int hw[ODI_GPON_HW_GEM_CAM_ROWS],
+			      uint32_t type[ODI_GPON_HW_GEM_CAM_ROWS]);
+int odi_gpon_hw_alloc_id_assign(uint16_t alloc_id);
+int odi_gpon_hw_alloc_id_release(uint16_t alloc_id);
+void odi_gpon_hw_eqd_rewrite(uint32_t eqd_bits);
+
+/* ---- Seams for odi_gpon.c, which owns the kernel clock and timers while
+ * the core stays host-testable: the BER interval, the REI send, the PLOAM
+ * log.
+ */
+
+/* BER_Interval (G.984.3 clause 9.2.3.18), in downstream frames, as last
+ * received; 0 = none yet, and the REI timer stays disarmed.
+ */
+void odi_gpon_hw_note_ber_interval(uint32_t interval_frames);
+uint32_t odi_gpon_hw_get_ber_interval_frames(void);
+
+/* Sends a complete upstream PLOAM message through the FIFO path every
+ * reply uses; the REI timer in odi_gpon.c sends through it.
+ */
+void odi_gpon_hw_send_us_ploam(const struct odi_gpon_ploam *msg);
+
+/* The same push, then waits up to wait_us for the urgent queue to empty,
+ * which says the message left: 0 left, -EBUSY not queued, -ETIMEDOUT
+ * queued but still waiting. Used by the Dying_Gasp reboot notifier.
+ */
+int odi_gpon_hw_send_us_ploam_wait(const struct odi_gpon_ploam *msg, unsigned int wait_us);
+
+/* Extended_Burst_Length (G.984.3 clause 9.2.3.20): the type 3 preamble
+ * byte counts before ranging and once ranged. Rewrites the burst overhead
+ * with the pattern/delimiter bytes Upstream_Overhead cached.
+ */
+void odi_gpon_hw_ext_burst_length(uint8_t pre_ranged_preamble_bytes,
+				   uint8_t post_o5_preamble_bytes);
+
+/* Observer for every PLOAM message received (dir 0) or sent (dir 1),
+ * called with the caller's lock held; feeds the /proc/odi_gpon/ploam ring. NULL
+ * after odi_gpon_hw_reset().
+ */
+typedef void (*odi_gpon_ploam_log_fn)(unsigned int dir, const struct odi_gpon_ploam *msg);
+void odi_gpon_hw_set_ploam_log(odi_gpon_ploam_log_fn fn);
+
+/* The module's TX-disable line, driven by the leaf from the state it
+ * writes: fn(1) on entering Emergency Stop (O7), fn(0) on any other state
+ * written while it was asserted (G.984.3 10.2.2 g: the ONU in O7 shuts its
+ * laser off; the stock GPON module drives its TX-disable GPIO exactly
+ * there). Returns 0 when the line moved. NULL (the default, and after
+ * odi_gpon_hw_reset()) drives nothing. Called with odi_gpon_lock held.
+ */
+typedef int (*odi_gpon_tx_disable_fn)(int disable);
+void odi_gpon_hw_set_tx_disable(odi_gpon_tx_disable_fn fn);
+/* 1 while the leaf holds the TX-disable line asserted (O7). */
+int odi_gpon_hw_tx_disabled(void);
+
+/* GPON_KEEP_DISABLE. 1 while Emergency Stop (O7) is held: odi_gpon_verb_
+ * deactivate() then leaves the ONU in O7 with the line asserted instead of
+ * O1, and odi_gpon_verb_activate() puts it in O7 instead of O2, so none of
+ * this side's own restarts undoes what the OLT did (G.984.3 Table 10-1:
+ * O7 is left only by the OLT enable). hold_set(1) asserts the line at
+ * once; hold_set(0) releases it with the flag. hold_enter() writes O7 now (state register, line, the FSM) and
+ * sends nothing. Called with odi_gpon_lock held.
+ */
+int odi_gpon_hw_hold_get(void);
+void odi_gpon_hw_hold_set(int hold);
+void odi_gpon_hw_hold_enter(struct odi_gpon_fsm *fsm);
+
+/* Whether the feature is on at all (hold_enable(), the gponkeep verb), and
+ * what a transition did to the hold. Off, nothing is tracked.
+ */
+enum odi_gpon_hold_change {
+	ODI_GPON_HOLD_UNCHANGED,
+	ODI_GPON_HOLD_RECORDED,	/* the OLT disabled this ONU: O7 is now held */
+	ODI_GPON_HOLD_RELEASED,	/* the OLT enabled it: the hold ended */
+};
+void odi_gpon_hw_hold_enable(int keep);
+int odi_gpon_hw_hold_enabled(void);
+enum odi_gpon_hold_change odi_gpon_hw_hold_track(enum odi_gpon_state prev, enum odi_gpon_state now);
+
+/* TEST HOOK, the gponhold sim verb: the FSM is handed a Disable_Serial_Number
+ * for its own serial number, as if the OLT had sent it. Sends nothing.
+ */
+void odi_gpon_hw_hold_simulate_disable(struct odi_gpon_fsm *fsm);
+
+#endif /* ODI_GPON_DRV_H */

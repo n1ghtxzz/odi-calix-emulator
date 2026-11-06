@@ -1,0 +1,155 @@
+name: release
+
+# Pushing a vX.Y.Z tag builds the full flashable image -- kernel, packages,
+# our own tools, confd and metricsd from their own public releases -- with
+# ROOT_PW=locked (docs/BUILDING.md): a public release image ships keys-only,
+# never a per-build password baked into a squashfs anyone can unpack. The
+# result is published as a GitHub release: the tarball, its SHA256SUMS, an
+# SBOM (tools/generate-sbom.sh), release notes built from CHANGELOG.md by
+# tools/release-notes.sh, and a build-provenance + SBOM attestation for the
+# tarball, its checksums and the SBOM itself -- see docs/FLASHING.md,
+# "Verifying a release", for how to check them.
+#
+# A tag with a hyphen after the version (v1.2.2-beta.1) is a test build: it
+# is published as a GitHub pre-release, never marked latest, with the
+# `## Unreleased` changelog section as its notes (tools/release-notes.sh).
+#
+# The tests run first (the `tests` job; the release job needs it), so a tag
+# on a tree whose `make test` fails publishes nothing.
+#
+# This is the one workflow here that actually builds the kernel and the
+# image (ci.yml deliberately does not: about an hour of compiling a runner
+# would spend on every push). Expect this job to take several minutes.
+#
+# concurrency: a tag push has landed here twice for the same ref before
+# (the tag itself pushed, then the branch it was cut from merged a moment
+# later under the same name) -- two runs racing on the same VERSION, the
+# second one failing outright at "gh release create" because the release
+# the first run made already exists. The group serialises them instead of
+# cancelling either (a half-finished release build is worse than a slow
+# second one), and the publish step below is idempotent on top of that, so
+# a rerun -- whatever triggers it -- can never fail this way again.
+on:
+  push:
+    tags: ['v*']
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  # The release is gated on the same tests as a pull request (`make test`:
+  # lint, the host-side tests, diag and every OMCI suite). A tag push also
+  # starts ci.yml, but a separate workflow cannot be waited for from here, and
+  # until now nothing stopped the image from being published while the tests
+  # failed or were still running. The full-system qemu job, the clean-build
+  # check and the reproducibility check stay in ci.yml; this is the cheap part
+  # that must pass before a build is published.
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Tests
+        run: |
+          command -v shellcheck >/dev/null || {
+            tools/ci-apt.sh shellcheck
+          }
+          make test
+
+  release:
+    needs: tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # Upstream tarballs (busybox, dropbear, iproute2, the Linux tree and its
+      # signature) and the confd/metricsd release assets land in dl/. The key
+      # is the files that pin their versions and SHA-256s, so a bump misses the
+      # cache and fetches anew. A hit only skips the download: every fetch
+      # script still re-checks the pinned SHA-256 of the file it finds there.
+      - name: Cache pinned downloads (dl/)
+        uses: actions/cache@v5
+        with:
+          path: |
+            dl
+          key: dl-release-${{ runner.os }}-${{ hashFiles('packages/fetch.sh', 'packages/*/build.sh', 'kernel/618/fetch.sh', 'src/fetch-releases.sh') }}
+
+      - name: Version from the tag
+        run: echo "VERSION=${GITHUB_REF_NAME}" >> "$GITHUB_ENV"
+
+      - name: Build the release image (keys-only root)
+        run: VERSION="$VERSION" ROOT_PW=locked make image-all
+
+      - name: Checksums
+        working-directory: out/image
+        run: sha256sum "$VERSION.tar" > SHA256SUMS
+
+      - name: No password file made it into the release
+        working-directory: out/image
+        run: |
+          if ls root-password*.txt >/dev/null 2>&1; then
+            echo "release.yml: a root-password file exists for a ROOT_PW=locked build -- refusing to publish" >&2
+            exit 1
+          fi
+
+      # Reads the pins already in the tree (kernel/618/fetch.sh,
+      # packages/*/build.sh, toolchain/images.env) plus the metricsd/confd
+      # tags make image-all actually fetched (out/bin/releases.env) --
+      # tools/generate-sbom.sh header has the detail.
+      - name: SBOM
+        run: tools/generate-sbom.sh "$VERSION" out/bin/releases.env > out/image/sbom.cdx.json
+
+      - name: Release notes
+        run: tools/release-notes.sh "$VERSION" > /tmp/release-notes.md
+
+      # Provenance for the image, its checksums and the SBOM: signed,
+      # keyless, tied to this workflow run. gh attestation verify checks
+      # them against the file bytes, so this has to run before either is
+      # renamed -- and before the SBOM step output is touched again.
+      - name: Attest build provenance (image tarball + checksums)
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: |
+            out/image/${{ env.VERSION }}.tar
+            out/image/SHA256SUMS
+
+      - name: Attest SBOM
+        uses: actions/attest-sbom@v3
+        with:
+          subject-path: out/image/${{ env.VERSION }}.tar
+          sbom-path: out/image/sbom.cdx.json
+
+      # Idempotent: a rerun for a VERSION whose release already exists (the
+      # concurrency group above is about ordering, not about preventing
+      # this -- a manual workflow_dispatch retry or a second tag push still
+      # lands here) edits the existing release and re-uploads its assets
+      # with --clobber instead of failing on "already exists".
+      - name: Publish the GitHub release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          assets=(
+            "out/image/$VERSION.tar"
+            out/image/SHA256SUMS
+            out/image/sbom.cdx.json
+          )
+          flags=()
+          case "$VERSION" in
+          *-*) flags=(--prerelease --latest=false) ;;
+          esac
+          if gh release view "$VERSION" >/dev/null 2>&1; then
+            echo "release.yml: $VERSION already exists, updating notes and re-uploading assets" >&2
+            gh release edit "$VERSION" --title "$VERSION" --notes-file /tmp/release-notes.md "${flags[@]}"
+            gh release upload "$VERSION" "${assets[@]}" --clobber
+          else
+            gh release create "$VERSION" "${assets[@]}" \
+              --title "$VERSION" \
+              --notes-file /tmp/release-notes.md "${flags[@]}"
+          fi

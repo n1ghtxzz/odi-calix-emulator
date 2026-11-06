@@ -1,0 +1,295 @@
+name: ci
+
+# Pull requests and pushes to main run the tests, as parallel jobs: lint, the host-side
+# tests (plain, and again under ASan/UBSan), diag with the exporter contract, and the OMCI daemon under qemu
+# (which builds the binaries it runs), a clean-build check (fetch and
+# verify the pinned kernel tree, build src, then confirm `make image` fails
+# closed and names what it is missing -- nothing here is flashed or booted),
+# and test-qemu (boots the real rootfs full-system on a STOCK kernel from
+# odi-toolchain, never this repository's own -- docs/HACKING.md). A release
+# tag runs the full suite: the tests, then the build of every freestanding
+# binary in src/ on its own. This repository's own kernel and the full
+# image are not built here: about an hour of compiling this runner would
+# spend, and nothing in either is exercised without a stick.
+on:
+  push:
+    branches: [main]
+    tags: ['v*', 'odi-oss-*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  changelog:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: PR touches CHANGELOG.md, or is docs/CI-only, or is labelled no-changelog
+        env:
+          LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          case ",$LABELS," in
+            *,no-changelog,*)
+              echo "changelog: no-changelog label set, skipping"
+              exit 0
+              ;;
+          esac
+
+          changed=$(git diff --name-only "origin/$BASE_REF...HEAD")
+          echo "$changed"
+
+          non_exempt=$(echo "$changed" | grep -Ev '^(docs/|\.github/)' || true)
+          if [ -z "$non_exempt" ]; then
+            echo "changelog: docs-only or CI-only change, no CHANGELOG.md entry required"
+            exit 0
+          fi
+
+          if ! echo "$changed" | grep -qx "CHANGELOG.md"; then
+            echo "changelog: this PR changes files outside docs/CI but does not touch CHANGELOG.md" >&2
+            echo "changelog: add an entry under \"## Unreleased\", or apply the no-changelog label" >&2
+            exit 1
+          fi
+
+  # Four jobs side by side instead of one job running four steps: the
+  # slowest of them, not their sum, is the wall time of a pull request.
+  # shellcheck is on the runner image; the install is only a fallback.
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Lint (shellcheck, inline-quote check)
+        run: |
+          command -v shellcheck >/dev/null || {
+            tools/ci-apt.sh shellcheck
+          }
+          make lint
+
+  host:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Host-side tests
+        run: make test-host
+
+  # The C unit tests of the host leg again, built with AddressSanitizer and
+  # UndefinedBehaviorSanitizer (make test-host-asan). A separate job so the
+  # plain leg stays the plain build. The runner has the sanitizer runtimes with
+  # its gcc; no container, no cache needed: nothing is downloaded.
+  host-asan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Host C tests under ASan and UBSan
+        run: make test-host-asan
+
+  diag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: diag, including the exporter contract under qemu
+        run: make test-diag
+
+  # The OMCI daemon under qemu-user, one job per suite (src/omci/*-test.sh,
+  # `make test-omci-<suite>`); `make test-omci` runs them all in one go.
+  # Each job builds only omcli and omcid.
+  omci:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [qemu, drv, resume, events, swdl, vlan, reload, live, keys, tables, getall, alarms, writes, mcast, pm, enc, voip, e7, emulation, calix, calixcfg, e7model]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build omcli and omcid
+        run: make test-omci-build
+
+      - name: "OMCI daemon under qemu: ${{ matrix.suite }}"
+        run: make test-omci-${{ matrix.suite }}
+
+  # The unit tests of omcid's class 171 decode (src/omci/respond) and of igmpd
+  # (src/igmp/test), under qemu-user in the diag toolchain container. They
+  # were in no job before; `make test` runs them as legs too.
+  mips-units:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [test-omci-respond, test-igmp]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: "Unit tests: ${{ matrix.target }}"
+        run: make ${{ matrix.target }}
+
+  clean-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # Upstream tarballs (busybox, dropbear, iproute2, the Linux tree and its
+      # signature) and the confd/metricsd release assets land in dl/. The key
+      # is the files that pin their versions and SHA-256s, so a bump misses the
+      # cache and fetches anew. A hit only skips the download: every fetch
+      # script still re-checks the pinned SHA-256 of the file it finds there.
+      - name: Cache pinned downloads (dl/)
+        uses: actions/cache@v5
+        with:
+          path: |
+            dl
+          key: dl-clean-build-${{ runner.os }}-${{ hashFiles('packages/fetch.sh', 'packages/*/build.sh', 'kernel/618/fetch.sh', 'src/fetch-releases.sh') }}
+
+      # Fetches the pinned linux-6.18.x fresh (VERSION in kernel/618/fetch.sh) and re-checks its
+      # pinned SHA-256 and the upstream GPG signature; packs it into
+      # build/kernel-618/tree.tar. Does not compile it -- that is the ~hour
+      # this job is not paying.
+      - name: "Kernel tree: fetch and verify the pin"
+        run: make kernel-tree
+
+      - name: Our binaries (freestanding, in the freestanding toolchain image)
+        run: make src
+
+      # `make releases` is skipped here; image/build.sh already refuses to
+      # assemble a partial image (ALLOW_PARTIAL=1 overrides that,
+      # deliberately not set), so `make image` on this tree -- kernel and
+      # packages never built -- must fail, and must say what it is missing
+      # rather than fail silently or on an unrelated error.
+      - name: make image on a partial tree fails closed, naming what is missing
+        run: |
+          if make image > image.log 2>&1; then
+            echo "make image: expected failure (kernel/packages/releases not built here), but it exited 0" >&2
+            cat image.log
+            exit 1
+          fi
+          cat image.log
+          grep -q "missing inputs" image.log || {
+            echo "make image: failed as expected, but did not name the missing inputs" >&2
+            exit 1
+          }
+
+  test-qemu:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      # Upstream tarballs (busybox, dropbear, iproute2, the Linux tree and its
+      # signature) and the confd/metricsd release assets land in dl/. The key
+      # is the files that pin their versions and SHA-256s, so a bump misses the
+      # cache and fetches anew. A hit only skips the download: every fetch
+      # script still re-checks the pinned SHA-256 of the file it finds there.
+      - name: Cache pinned downloads (dl/)
+        uses: actions/cache@v5
+        with:
+          path: |
+            dl
+          key: dl-test-qemu-${{ runner.os }}-${{ hashFiles('packages/fetch.sh', 'packages/*/build.sh', 'kernel/618/fetch.sh', 'src/fetch-releases.sh') }}
+
+      - name: qemu-system-mips
+        run: tools/ci-apt.sh qemu-system-mips
+
+      # Everything test-qemu boots except the kernel (a stock, prebuilt
+      # image, toolchain/images.env): busybox, dropbear/ip/bridge, our own
+      # freestanding tools, and confd/metricsd from their own releases.
+      - name: busybox, packages, src, releases
+        run: |
+          make busybox
+          make packages
+          make src
+          make releases
+
+      - name: Boot the real rootfs under qemu-system-mips and check it
+        run: make test-qemu
+
+      # rcS's action trace against its goldens (test/fixtures/rcs-trace-*):
+      # needs the busybox built above and docker with ptrace, both here. It
+      # was in no job, and the goldens had gone stale without anything saying so.
+      - name: rcS action trace against its goldens
+        run: make test-rcs
+
+  full:
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    needs: [lint, host, host-asan, diag, omci, mips-units]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Our binaries (freestanding, in the freestanding toolchain image)
+        run: make src
+
+  # Builds the full flashable image twice, in two separate checkouts, and
+  # diffs the two tarballs member by member (tools/compare-images.sh):
+  # proof that the release build depends on the sources and the pinned
+  # toolchain/kernel/package versions, and on nothing else -- wall-clock
+  # time and build-host identity included, once the documented stamps
+  # (etc/version, etc/odi-build, the banner busybox compiles into itself,
+  # the /etc/passwd ROOT_PW=locked writes) are set aside.
+  #
+  # Tags and workflow_dispatch only, not pull_request: this is `image-all`
+  # run twice, about 25 minutes native each per the top-level Makefile
+  # estimate, and a runner is slower than that. Twice that on every PR push
+  # would make the queue the bottleneck for everything else in this file;
+  # release.yml already pays for one full build on every tag, so a second
+  # one here to compare against costs the same order of time, not double
+  # the total cost of the workflow.
+  reproducible:
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: build-a
+
+      - uses: actions/checkout@v7
+        with:
+          path: build-b
+
+      # Upstream tarballs (busybox, dropbear, iproute2, the Linux tree and its
+      # signature) and the confd/metricsd release assets land in dl/. The key
+      # is the files that pin their versions and SHA-256s, so a bump misses the
+      # cache and fetches anew. A hit only skips the download: every fetch
+      # script still re-checks the pinned SHA-256 of the file it finds there.
+      - name: Cache pinned downloads (dl/)
+        uses: actions/cache@v5
+        with:
+          path: |
+            build-a/dl
+            build-b/dl
+          key: dl-reproducible-${{ runner.os }}-${{ hashFiles('build-a/packages/fetch.sh', 'build-a/packages/*/build.sh', 'build-a/kernel/618/fetch.sh', 'build-a/src/fetch-releases.sh') }}
+
+      - name: Version for this comparison
+        run: echo "VERSION=${GITHUB_REF_NAME:-repro-dispatch}" >> "$GITHUB_ENV"
+
+      - name: squashfs-tools (unsquashfs, for the comparison step)
+        run: build-a/tools/ci-apt.sh squashfs-tools
+
+      # Distinct VOL names: the docker build cache kernel/build.sh uses is a
+      # named volume (odi-kbuild-618 by default), and both steps share the
+      # same docker daemon on this runner. Without this, Build B would reuse
+      # the incremental cache Build A left behind, and the two builds never
+      # being truly independent would go unnoticed -- the same failure mode
+      # this job exists to catch, just hidden instead of shown.
+      - name: Build A
+        working-directory: build-a
+        run: VERSION="$VERSION" ROOT_PW=locked VOL=odi-kbuild-618-a make image-all
+
+      - name: Build B
+        working-directory: build-b
+        run: VERSION="$VERSION" ROOT_PW=locked VOL=odi-kbuild-618-b make image-all
+
+      - name: Compare the two tarballs
+        run: |
+          build-a/tools/compare-images.sh \
+            "build-a/out/image/$VERSION.tar" "build-b/out/image/$VERSION.tar"

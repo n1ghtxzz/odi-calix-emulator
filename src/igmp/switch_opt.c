@@ -1,0 +1,67 @@
+#include "switch_opt.h"
+#include "sys.h"
+
+#define ODI_SW_DEV_PATH "/dev/odi_sw"
+
+/* One descriptor for the life of the daemon, opened on first use: every
+ * membership change is one ioctl, and reopening the device for each would
+ * only add two syscalls to each. A failed open is retried on the next call. */
+static long sw_fd = -1;
+
+static int sw_ioctl(unsigned long req, void *arg)
+{
+	if (sw_fd < 0) {
+		sw_fd = sys_open(ODI_SW_DEV_PATH, O_RDWR);
+		if (sw_fd < 0)
+			return (int)sw_fd;
+	}
+	return (int)sys_ioctl((int)sw_fd, req, arg);
+}
+
+int igmp_sw_mode(uint32_t *ipmc_on_group)
+{
+	struct odi_sw_l2_mode m;
+	int rc;
+
+	m.ipmc_on_group = 0;
+	m.rows = 0;
+	rc = sw_ioctl(ODI_SW_IOC_L2_MODE, &m);
+	if (rc)
+		return rc;
+	*ipmc_on_group = m.ipmc_on_group;
+	return 0;
+}
+
+int igmp_sw_mcast_add(struct odi_sw_l2_mcast *m)
+{
+	return sw_ioctl(ODI_SW_IOC_L2_MC_ADD, m);
+}
+
+int igmp_sw_mcast_del(struct odi_sw_l2_mcast *m)
+{
+	return sw_ioctl(ODI_SW_IOC_L2_MC_DEL, m);
+}
+
+int igmp_sw_snoop(uint32_t flags)
+{
+	struct odi_sw_mc_snoop sn;
+
+	sn.flags = flags;
+	sn.reserved = 0;
+	return sw_ioctl(ODI_SW_IOC_MC_SNOOP, &sn);
+}
+
+int igmp_sw_route(struct odi_sw_mc_route *r)
+{
+	return sw_ioctl(ODI_SW_IOC_MC_ROUTE, r);
+}
+
+int igmp_sw_send(struct odi_sw_mc_send *m)
+{
+	return sw_ioctl(ODI_SW_IOC_MC_SEND, m);
+}
+
+int igmp_sw_count(struct odi_sw_mc_count *c)
+{
+	return sw_ioctl(ODI_SW_IOC_MC_COUNT, c);
+}

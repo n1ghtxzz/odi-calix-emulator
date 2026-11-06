@@ -1,0 +1,12 @@
+{
+  "name": "odi-calix-emulator",
+  "version": "1.0.0",
+  "private": true,
+  "description": "ODI DFP-34X-2C2 firmware with Calix/E7 compatibility and RU/EN web UI",
+  "scripts": {
+    "test:web": "node test/web/ui-copy.cjs && node test/web/mib-browser.cjs"
+  },
+  "devDependencies": {
+    "playwright": "1.62.1"
+  }
+}

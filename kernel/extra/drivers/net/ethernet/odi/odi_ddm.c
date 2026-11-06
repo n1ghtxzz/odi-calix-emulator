@@ -1,0 +1,188 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * odi_ddm.c -- odi_ddm.h's own implementation: per-selector (device, byte
+ * address, length) table plus the odi_i2c_read_bytes() call and the
+ * output-buffer fill. See odi_ddm.h and odi_i2c.h for where each of these
+ * addresses comes from.
+ *
+ * SFF-8472 layout used here: A0h identification bytes 20-35 (vendor
+ * name) and 40-55 (part number), both 16-byte ASCII fields, space/NUL
+ * padded; A2h DDMI bytes 96-97 (temperature), 98-99 (voltage), 100-101
+ * (bias current), 102-103 (Tx power), 104-105 (Rx power), each a
+ * big-endian uint16 -- public SFF-8472 layout. Confirmed
+ * against a capture of a working stock DDM read: every byte address
+ * this table names is the exact I2C_BYTE_ADDR value the capture writes
+ * before the read that produced the matching output value.
+ */
+#include "odi_ddm.h"
+#include "odi_i2c.h"
+
+#ifdef __KERNEL__
+#include <linux/printk.h>
+/*
+ * linux/ratelimit.h: pr_info_ratelimited() needs DEFINE_RATELIMIT_STATE,
+ * which this kernel's linux/printk.h does not pull in on its own.
+ */
+#include <linux/ratelimit.h>
+#include <linux/errno.h> /* odi_ddm_get's -EINVAL, below */
+#else
+#include <errno.h> /* same, host build */
+#endif
+
+/* SFF-8472 byte offsets and field lengths, the public standard layout --
+ * <linux/sfp.h> names these same offsets (SFP_VENDOR_NAME, SFP_VENDOR_PN,
+ * SFP_TEMP, SFP_VCC, SFP_TX_BIAS, SFP_TX_POWER, SFP_RX_POWER), but that
+ * header is __KERNEL__-only and this file is host-tested as plain C
+ * (test/odi_ddm_test.c), so the names are restated here rather than
+ * pulled in, to keep one portable definition instead of a kernel-only
+ * one plus a host-side fallback that could drift from it.
+ */
+#define ODI_DDM_SFF8472_A0_VENDOR_NAME_OFF	20U
+#define ODI_DDM_SFF8472_A0_PART_NUMBER_OFF	40U
+#define ODI_DDM_SFF8472_A0_STRING_LEN		16U
+#define ODI_DDM_SFF8472_A2_TEMPERATURE_OFF	96U
+#define ODI_DDM_SFF8472_A2_VOLTAGE_OFF		98U
+#define ODI_DDM_SFF8472_A2_BIAS_CURRENT_OFF	100U
+#define ODI_DDM_SFF8472_A2_TX_POWER_OFF	102U
+#define ODI_DDM_SFF8472_A2_RX_POWER_OFF	104U
+#define ODI_DDM_SFF8472_A2_FIELD_LEN		2U
+
+/* Optional Status/Control (byte 110, bit 1 = RX_LOS) through the warning
+ * flags (byte 117), read as one contiguous 8-byte run: 110-111 (status/
+ * control, reserved), 112-113 (alarm flags), 114-115 (reserved), 116-117
+ * (warning flags) -- public SFF-8472 layout, same section that already
+ * documents the five numeric fields above.
+ */
+#define ODI_DDM_SFF8472_A2_ALARM_WARN_OFF	110U
+#define ODI_DDM_SFF8472_A2_ALARM_WARN_LEN	8U
+
+/* A0h 92-94: diagnostic monitoring type, enhanced options, SFF-8472
+ * compliance. A2h 0-39: the alarm and warning thresholds, 24 bytes for the
+ * first three measurements and 16 for the two optical powers. */
+#define ODI_DDM_SFF8472_A0_MONITOR_TYPE_OFF	92U
+#define ODI_DDM_SFF8472_A0_MONITOR_TYPE_LEN	3U
+#define ODI_DDM_SFF8472_A2_LIMITS_A_OFF		0U
+#define ODI_DDM_SFF8472_A2_LIMITS_A_LEN		24U
+#define ODI_DDM_SFF8472_A2_LIMITS_B_OFF		24U
+#define ODI_DDM_SFF8472_A2_LIMITS_B_LEN		16U
+
+/* A 16-bit reading is two byte transactions on this controller, and the
+ * module refreshes it on its own clock: a carry between the two reads
+ * gives the old high byte with the new low one, off by 256 counts (1 C of
+ * temperature, 0.5 mA of bias, 25.6 uW of received power). SFF-8472 wants
+ * the word read in one sequential access, which the controller does not do
+ * (the adapter's one-byte transaction, odi_i2c_adapter.c), so the high byte
+ * is read once more after the word: if it moved, a refresh happened in the
+ * middle and the word is read again. Bounded; a high byte that still moves
+ * after the last try is returned as read, the value being a sample anyway.
+ */
+#define ODI_DDM_WORD_TRIES	3
+
+static int odi_ddm_read(uint32_t sel, uint32_t addr, uint8_t *out, unsigned int n,
+			int checked)
+{
+	unsigned int tries;
+	uint8_t msb;
+	int rc;
+
+	if (!checked || n != ODI_DDM_SFF8472_A2_FIELD_LEN || sel != ODI_I2C_SEL_A2 ||
+	    addr < ODI_DDM_SFF8472_A2_TEMPERATURE_OFF ||
+	    addr > ODI_DDM_SFF8472_A2_RX_POWER_OFF)
+		return odi_i2c_read_bytes(sel, addr, out, n);
+
+	for (tries = 0; tries < ODI_DDM_WORD_TRIES; tries++) {
+		rc = odi_i2c_read_bytes(sel, addr, out, n);
+		if (rc)
+			return rc;
+		rc = odi_i2c_read_bytes(sel, addr, &msb, 1);
+		if (rc)
+			return rc;
+		if (msb == out[0])
+			return 0;
+	}
+	return 0;
+}
+
+static int odi_ddm_get_x(int type, uint8_t out[ODI_DDM_BUF_LEN], int checked)
+{
+	uint32_t sel, addr;
+	unsigned int n, i;
+
+	switch (type) {
+	case ODI_DDM_VENDOR_NAME:
+		sel = ODI_I2C_SEL_A0; addr = ODI_DDM_SFF8472_A0_VENDOR_NAME_OFF;
+		n = ODI_DDM_SFF8472_A0_STRING_LEN;
+		break;
+	case ODI_DDM_PART_NUMBER:
+		sel = ODI_I2C_SEL_A0; addr = ODI_DDM_SFF8472_A0_PART_NUMBER_OFF;
+		n = ODI_DDM_SFF8472_A0_STRING_LEN;
+		break;
+	case ODI_DDM_TEMPERATURE:
+		sel = ODI_I2C_SEL_A2; addr = ODI_DDM_SFF8472_A2_TEMPERATURE_OFF;
+		n = ODI_DDM_SFF8472_A2_FIELD_LEN;
+		break;
+	case ODI_DDM_VOLTAGE:
+		sel = ODI_I2C_SEL_A2; addr = ODI_DDM_SFF8472_A2_VOLTAGE_OFF;
+		n = ODI_DDM_SFF8472_A2_FIELD_LEN;
+		break;
+	case ODI_DDM_BIAS_CURRENT:
+		sel = ODI_I2C_SEL_A2; addr = ODI_DDM_SFF8472_A2_BIAS_CURRENT_OFF;
+		n = ODI_DDM_SFF8472_A2_FIELD_LEN;
+		break;
+	case ODI_DDM_TX_POWER:
+		sel = ODI_I2C_SEL_A2; addr = ODI_DDM_SFF8472_A2_TX_POWER_OFF;
+		n = ODI_DDM_SFF8472_A2_FIELD_LEN;
+		break;
+	case ODI_DDM_RX_POWER:
+		sel = ODI_I2C_SEL_A2; addr = ODI_DDM_SFF8472_A2_RX_POWER_OFF;
+		n = ODI_DDM_SFF8472_A2_FIELD_LEN;
+		break;
+	case ODI_DDM_ALARM_STATUS:
+		sel = ODI_I2C_SEL_A2; addr = ODI_DDM_SFF8472_A2_ALARM_WARN_OFF;
+		n = ODI_DDM_SFF8472_A2_ALARM_WARN_LEN;
+		break;
+	case ODI_DDM_MONITOR_TYPE:
+		sel = ODI_I2C_SEL_A0; addr = ODI_DDM_SFF8472_A0_MONITOR_TYPE_OFF;
+		n = ODI_DDM_SFF8472_A0_MONITOR_TYPE_LEN;
+		break;
+	case ODI_DDM_LIMITS_A:
+		sel = ODI_I2C_SEL_A2; addr = ODI_DDM_SFF8472_A2_LIMITS_A_OFF;
+		n = ODI_DDM_SFF8472_A2_LIMITS_A_LEN;
+		break;
+	case ODI_DDM_LIMITS_B:
+		sel = ODI_I2C_SEL_A2; addr = ODI_DDM_SFF8472_A2_LIMITS_B_OFF;
+		n = ODI_DDM_SFF8472_A2_LIMITS_B_LEN;
+		break;
+	default:
+#ifdef __KERNEL__
+		pr_info_ratelimited("odi_ddm: bad selector type=%d\n", type);
+#endif
+		return -EINVAL;
+	}
+
+	for (i = 0; i < ODI_DDM_BUF_LEN; i++)
+		out[i] = 0;
+
+	{
+		int i2c_rc = odi_ddm_read(sel, addr, out, n, checked);
+
+		if (i2c_rc != 0) {
+#ifdef __KERNEL__
+			pr_info_ratelimited("odi_ddm: i2c read failed type=%d sel=0x%08x addr=%u len=%u\n",
+					     type, sel, addr, n);
+#endif
+			return i2c_rc;
+		}
+	}
+	return 0;
+}
+
+int odi_ddm_get(int type, uint8_t out[ODI_DDM_BUF_LEN])
+{
+	return odi_ddm_get_x(type, out, 1);
+}
+
+int odi_ddm_get_stock(int type, uint8_t out[ODI_DDM_BUF_LEN])
+{
+	return odi_ddm_get_x(type, out, 0);
+}

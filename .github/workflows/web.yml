@@ -1,0 +1,19 @@
+name: Web interface
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  browser:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - run: python3 tools/build-ui-language.py
+      - run: git diff --exit-code -- web
+      - run: npm run test:web

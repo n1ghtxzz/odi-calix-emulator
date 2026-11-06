@@ -1,0 +1,241 @@
+#!/bin/sh
+#
+# /etc/init.d/rcS -- the boot, run by init as sysinit (/etc/inittab). One
+# stage after another; docs/BOOT.md has what each stage does and why it is
+# where it is.
+#
+# Nothing here may block and nothing may abort. init starts no respawn
+# entry, so no shell and no way back in, until sysinit returns; this runs
+# under set -e, so every step that can fail is guarded, reports and carries
+# on.
+#
+# /etc/init.d/rcS.dev, when present, adds the development aids
+# (breadcrumbs.on, confirm-arp, the pon-steps override) by redefining the
+# functions below. Without it they do nothing.
+
+set -e
+
+# kmsg, crumb, dev_hook, dev_confirm_ok, config_mounted, required_mounts_ok
+# and CONFIG_DIR are shared with rcS.pon (the PON steps, run after this
+# script by /etc/inittab as a `once` entry) via rcs-lib.sh, so both see the
+# same definitions rather than two copies drifting apart. rcS.dev, sourced
+# after it, redefines crumb/dev_hook/dev_confirm_ok/pon_steps when present.
+. /etc/scripts/rcs-lib.sh
+if [ -r /etc/init.d/rcS.dev ]; then
+	. /etc/init.d/rcS.dev
+fi
+
+# ---- mounts. /dev is devtmpfs, mounted by the kernel before init
+# (CONFIG_DEVTMPFS_MOUNT), with every node by name. Declarative, from
+# /etc/fstab (docs/BOOT.md): proc, sysfs, /var (tmpfs, an overall size cap,
+# docs/SETTINGS.md), /var/tmp (its OWN, separate, bigger tmpfs -- the one
+# place scp/sftp and a firmware upload's staging area write, and must give
+# ENOSPC on its own cap rather than eat the memory every other daemon
+# needs), devpts, and the config partition (mtd:config, jffs2, by MTD
+# partition NAME -- no /dev/mtdblockN node, no /proc/mtd lookup, no mdev
+# race to win). Neither tmpfs cap reserves RAM up front -- "size=" bounds
+# usage, it does not pin pages.
+#
+# One `mount -a` cannot do all six in a single pass: /var/tmp and
+# /var/config are paths UNDER /var, which does not exist as a mountpoint
+# with any subdirectories of its own until the /var line above it has
+# already landed (mount never creates a missing mountpoint), so this runs
+# `mount -a` once for what needs nothing more than /proc and /sys, creates
+# the five /var subdirectories, then runs it again for the two that
+# needed them. Already-mounted entries are skipped harmlessly the second
+# time.
+kmsg "start"
+mkdir -p /dev/pts 2>/dev/null || echo "rcS: /dev/pts could not be created" >&2
+# The first `mount -a` cannot be traced into /tmp: /tmp is a symlink to
+# /var/tmp, and neither exists as a directory until /var itself has been
+# mounted, which is what this call is for -- ash treats a `>` target whose
+# parent is missing as a redirection error and never runs the command at
+# all, silently skipping every mount in the list. Whatever busybox mount
+# prints goes to the inherited stdout/stderr instead, same as every other
+# unguarded step here.
+/bin/mount -a || echo "rcS: mount -a (pass 1) reported a failure" >&2
+for d in tmp log run lock config; do
+	mkdir -p "/var/$d" || echo "rcS: /var/$d could not be created" >&2
+done
+# omcid own ping deadline to odi_wdt (docs/SETTINGS.md, "Watchdog rules");
+# matches ODI_WDT_OMCID_DEADLINE_S in odi_wdt.h, kept here too since rcS is
+# what actually writes it and a kernel/rootfs pair should never disagree
+# silently.
+ODI_WDT_OMCID_DEADLINE_S=${ODI_WDT_OMCID_DEADLINE_S:-60}
+# vm.min_free_kbytes: the kernel default on a 32 MB box is small (around
+# 128 KB) -- raised modestly so the page allocator always keeps a slightly
+# larger reserve free, giving a starved critical daemon (oom_score_adj
+# -1000 below) and the OOM killer itself a better chance to make forward
+# progress instead of every allocator racing for the same last few pages.
+# docs/SETTINGS.md has the number and the reasoning; not a cgroup or memcg
+# limit, just the global watermark.
+echo 1536 > /proc/sys/vm/min_free_kbytes 2>/dev/null || echo "rcS: vm.min_free_kbytes not set" >&2
+/bin/mount -a >> /tmp/mount-a.trace 2>&1 || echo "rcS: mount -a (pass 2) reported a failure, see /tmp/mount-a.trace" >&2
+required_mounts_ok || true
+
+# ---- the config partition: jffs2, shared with the stock slot, never
+# written by fwu.sh. Host keys, the UI credentials and every switch file
+# live there. The mount itself is the /etc/fstab line above (mount -a,
+# pass 2); mount-config.sh, still traced under `sh -x` so a failure here
+# leaves something in the ramlog, only confirms /etc/config -- a symlink
+# baked into the read-only squashfs -- actually resolves to where it
+# landed. config_mounted() (above) is the one place anything else asks
+# whether it is really there: the live mount table, not a flag set once
+# here and never rechecked.
+sh -x /etc/scripts/mount-config.sh > /tmp/mount-config.trace 2>&1 || echo "rcS: config partition symlink check failed" >&2
+if ! config_mounted; then
+	kmsg "config partition NOT mounted, breadcrumbs unavailable"
+fi
+if [ -r /etc/odi-profile/id ] && config_mounted; then
+	# Bounded first-boot settings, before the management interface and OMCI.
+	timeout 60 /etc/scripts/profile-seed.sh || echo "rcS: image profile incomplete" >&2
+fi
+dev_hook config
+crumb "config mounted; kernel $(uname -r); $(grep -c "^mtd" /proc/mtd) mtd partitions; $(cat /etc/version 2>/dev/null)"
+
+# ---- the boot counter and the safe mode (docs/SETTINGS.md, "Recovery: the
+# safe mode"), as early as the config partition allows, so a short power-up
+# still counts: every boot adds one, a boot that reaches 60 s of uptime
+# clears it, and after enough short boots in a row this boot becomes the
+# safe one (the PON off, the host port in Fiber 1G with auto-negotiation,
+# the default password, for this boot only). Boots that ended in a watchdog reset count
+# too, and a config partition that is not mounted makes this boot the safe
+# one at once. Logs the uptime of the count. Bounded.
+if config_mounted; then
+	/etc/scripts/safe-mode.sh count || echo "rcS: safe-mode.sh count failed" >&2
+else
+	/etc/scripts/safe-mode.sh no-config || echo "rcS: safe-mode.sh no-config failed" >&2
+fi
+
+# ---- entropy. Nothing on this board feeds the pool early, so without a
+# seed every daemon starts on a nearly empty one. seedrng credits the seed
+# the previous boot saved and writes a fresh one. This early the pool is
+# not initialised, so the fresh seed is not creditable; the second run, 90 s
+# in, saves one the next boot can credit.
+if [ -x /bin/seedrng ] && [ -d /etc/config ]; then
+	mkdir -p /etc/config/seedrng 2>/dev/null && \
+		/bin/seedrng -d /etc/config/seedrng || echo "rcS: seedrng failed" >&2
+	( sleep 90; /bin/seedrng -d /etc/config/seedrng > /dev/null 2>&1 ) &
+fi
+
+# sethostname can fail (the chroot harness has no privilege for it), and a
+# cosmetic string must not cost the boot.
+if [ -s /etc/hostname ]; then
+	/bin/hostname -F /etc/hostname || echo "rcS: hostname not set" >&2
+fi
+/sbin/ifconfig lo 127.0.0.1 up || echo "rcS: loopback did not come up" >&2
+
+# ---- the switch SDK-init verbs, in the order the stock firmware issues
+# them, before the network: without them no frame passes between the CPU
+# port and the host port, and network.sh needs diag for its SerDes check.
+# A crumb before and after each, so a verb that hangs names itself.
+#
+# Deliberately NOT write_proc_bounded here (docs/SETTINGS.md, "Bounded
+# waits"): this loop is the hottest part of the boot -- 23 steps, every
+# boot, no exception -- and turning each `echo`/`cat` builtin into a
+# `timeout`+`sh` fork pair nearly doubled the process count on the one path
+# this image has fought hardest to keep fast (rc2 to rc3: 85-90 s boot down
+# to 31 s). No step here has ever been observed to hang; the crumb before
+# and after each already names a stuck one in the ramlog if it ever does.
+# The bound is worth the fork cost on apply.sh's gpondeact/gponpw/gponact
+# (a handful of calls, user-triggered, off the boot path) and on
+# rcs-lib.sh's PON steps and switch_init (a handful of calls, once per
+# boot) -- not on a 23-iteration loop with no history of hanging.
+if [ -w /proc/odi_init ]; then
+	for step in intr irq switch svlan stp oam acl qos sec rate classify stat trunk l2 vlan port mirror cpu rldp trap gpio time ponmac; do
+		crumb "odi_init step $step: start"
+		echo "$step" > /proc/odi_init 2>/dev/null || echo "rcS: odi_init $step failed to start" >&2
+		crumb "odi_init step $step: ret $(cat /proc/odi_init 2>/dev/null)"
+	done
+fi
+
+# ---- the management address, from the config partition, before the
+# services: dropbear bound on a box with no address looks like a panic.
+# network.sh first sets the host SerDes mode (host-serdes.sh boot,
+# HOST_SERDES): Fiber 1G unless the key says otherwise.
+/etc/scripts/network.sh || echo "rcS: no management address" >&2
+crumb "network: $(ifconfig br0 2>/dev/null | sed -n "s/.*inet addr:\([0-9.]*\).*/\1/p") on br0, eth0 $(cat /sys/class/net/eth0/operstate 2>/dev/null)"
+dev_hook network
+
+# ---- the host-port auto-negotiation (HOST_AUTONEG, docs/SETTINGS.md), after
+# network.sh has set the SerDes mode it changes one bit of. With the key
+# absent or on it reads the key and returns: nothing written, nothing
+# counted. With it off it counts the boot for the safe mode (three short
+# boots in a row clear the key), forces 1000BASE-X, and starts the boot
+# watch in the background, which falls back to auto-negotiation when the
+# host link does not come up. While HOST_SERDES runs another mode, which
+# sets the bit itself, it applies nothing. Bounded; it returns at once
+# either way.
+/etc/scripts/host-autoneg.sh boot || echo "rcS: host-autoneg.sh boot failed" >&2
+
+# ---- ptys. devpts is mounted on /dev/pts already (the /etc/fstab mounts,
+# above), for the /dev/ptmx that dropbear opens for an interactive session;
+# the BSD pairs made here are the fallback it can also scan. devtmpfs
+# normally has them.
+if [ ! -c /dev/ptyp0 ]; then
+	i=0
+	for c in 0 1 2 3 4 5 6 7 8 9 a b c d e f; do
+		mknod "/dev/ptyp$c" c 2 "$i" 2>/dev/null || true
+		mknod "/dev/ttyp$c" c 3 "$i" 2>/dev/null || true
+		i=$((i + 1))
+	done
+fi
+
+# ---- the services (metricsd, confd, dropbear, omcid) are no longer
+# started from here: each is its own `respawn` entry in /etc/inittab
+# (docs/SETTINGS.md, "native over hand-rolled" -- supervise.sh and
+# `services start` are gone). init starts no respawn entry until this
+# script returns, so they still come up only after everything above --
+# in particular the management address -- is in place; nothing here needs
+# to launch or wait for them.
+crumb "rcS done; daemons are inittab respawn entries"
+
+# /var is ramfs and nothing there is evicted; omcid logs every OMCI frame
+# (about 1.7 MB a day on a busy OLT). Each log is cut back to its last
+# LOG_KEEP bytes past LOG_MAX. The writers append, so they carry on at the
+# new end.
+LOG_MAX=262144
+LOG_KEEP=131072
+(
+	while :; do
+		sleep 60
+		for f in /var/log/omcid.log /var/log/services.log; do
+			[ -f "$f" ] || continue
+			n=$(wc -c < "$f" 2>/dev/null)
+			[ "${n:-0}" -gt "$LOG_MAX" ] || continue
+			tail -c "$LOG_KEEP" "$f" > "$f.cut" 2>/dev/null && cat "$f.cut" > "$f"
+			rm -f "$f.cut"
+		done
+	done
+) &
+dev_hook services
+
+# ---- register the watchdog clients. The kernel (odi_wdt), not a userland
+# process, judges every deadline from here on (docs/SETTINGS.md, "Watchdog
+# rules"): a client pings its OWN deadline from its OWN main loop (omcid
+# does, in src/omci/respond/main.c), and the kernel stops kicking the
+# hardware watchdog if an armed client misses its deadline. Registering
+# arms the deadline immediately, counted from registration -- a client that
+# never pings at all is caught exactly like one that stalls after pinging
+# once (odi_wdt.h) -- so this must only run for a client that is actually
+# about to start. Gated on the same conditions svc-omcid.sh checks before
+# it execs omcid: a dev image with /etc/config/modules.off, omcid stopped
+# with `services stop omcid` (omcid.off), or an image missing the binary,
+# must not register a client the kernel will then wait on forever. A stick whose kernel predates /proc/odi_wdt/register (none we
+# ship, but a stray old image) just sees the write fail silently and
+# behaves as if no client were registered at all.
+if [ -w /proc/odi_wdt/register ] && [ ! -f /etc/config/modules.off ] && [ ! -f /etc/config/omcid.off ] && [ -x /bin/omcid ]; then
+	write_proc_bounded /proc/odi_wdt/register "omcid $ODI_WDT_OMCID_DEADLINE_S" 2>/dev/null || \
+		echo "rcS: could not register omcid with odi_wdt" >&2
+	crumb "odi_wdt: omcid registered, deadline ${ODI_WDT_OMCID_DEADLINE_S}s"
+fi
+
+# ---- the PON steps (optics, i2c/gpon/switch-init/confirm/gponsn/gponpw/
+# gponact) no longer run here: they are /etc/init.d/rcS.pon, a `once` entry
+# in /etc/inittab started right after this script (sysinit) returns --
+# concurrently with the respawn daemons init starts in the same breath, the
+# same real-world overlap `services start &` already had with them before
+# v1.0.4 (rcS.pon gates the one step that actually needs omcid up --
+# gponact -- on its odi_omci registration; see rcs-lib.sh).
+
+exit 0

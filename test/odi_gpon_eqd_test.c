@@ -1,0 +1,359 @@
+/* SPDX-License-Identifier: GPL-2.0 */
+/*
+ * odi_gpon_eqd_test.c -- the USF_EQ_DELAY and burst overhead values odi_gpon_hw.c writes, against
+ * test/odi_switch_mock.h: the split of the equalization delay into FRAMES and
+ * INFRAME (the DELAY_HI term goes in before the division), the pre-assigned
+ * delay of Upstream_Overhead (G.984.3 clause 9.2.3.1), and a Ranging_Time
+ * with the protection path bit set (clause 9.2.3.4), which writes nothing.
+ *
+ * The register values are the ones the captured activation shows (one
+ * upstream frame is 155520 bits, USF_MIN_RESP_DELAY 0x9132, so DELAY_HI is
+ * 290 and DELAY_HI << 7 is 37120), plus cases the two test lines never hit.
+ */
+#include "odi_switch_unity.h"
+#include "../kernel/extra/drivers/net/ethernet/odi/odi_gpon_ploam.c"
+#include "../kernel/extra/drivers/net/ethernet/odi/odi_gpon_fsm.c"
+#include "../kernel/extra/drivers/net/ethernet/odi/odi_gpon_hw.c"
+#include "../kernel/extra/drivers/net/ethernet/odi/odi_gpon_isr.c"
+
+#include <stdio.h>
+
+static int failures;
+
+#define CHECK(cond, msg) do { \
+	if (!(cond)) { \
+		fprintf(stderr, "FAIL: %s (%s:%d)\n", msg, __FILE__, __LINE__); \
+		failures++; \
+	} \
+} while (0)
+
+#define FRAME_BITS	155520U
+#define DELAY_HI_BITS	37120U	/* 290 << 7, from USF_MIN_RESP_DELAY 0x9132 */
+#define NO_CARRY_LIMIT	(FRAME_BITS - DELAY_HI_BITS)	/* 118400 */
+
+static uint32_t eq_delay_reg(void)
+{
+	return odi_mock.regs[odi_mock_slot(ODI_GPON_USF_EQ_DELAY_OFF)];
+}
+
+static void expect_eqd(uint32_t eqd_bits, uint32_t frames, uint32_t inframe, const char *what)
+{
+	char msg[160];
+
+	odi_gpon_hw_eqd_rewrite(eqd_bits);
+	snprintf(msg, sizeof msg, "%s: FRAMES", what);
+	CHECK(ODI_GPON_USF_EQ_DELAY_FRAMES_GET(eq_delay_reg()) == frames, msg);
+	snprintf(msg, sizeof msg, "%s: INFRAME", what);
+	CHECK(ODI_GPON_USF_EQ_DELAY_EQD_GET(eq_delay_reg()) == inframe, msg);
+}
+
+/* What the code did before the total was formed first: divide the delay,
+ * then add the DELAY_HI term to the remainder.
+ */
+static void old_split(uint32_t eqd_bits, uint32_t *frames, uint32_t *inframe)
+{
+	*frames = eqd_bits / FRAME_BITS;
+	*inframe = (eqd_bits % FRAME_BITS) + DELAY_HI_BITS;
+}
+
+static void setup(void)
+{
+	odi_mock_reset();
+	odi_gpon_hw_reset();
+	odi_mock.regs[odi_mock_slot(ODI_GPON_USF_MIN_RESP_DELAY_OFF)] = 0x9132U;
+}
+
+static void test_split(void)
+{
+	uint32_t f, i;
+
+	setup();
+
+	/* The captured delay, both test lines: 227172 bits -> 1 frame + 108772. */
+	expect_eqd(227172U, 1U, 108772U, "captured delay");
+
+	/* No carry: the remainder is below 118400, so the old order gives the
+	 * same registers, checked against it.
+	 */
+	old_split(FRAME_BITS + 10000U, &f, &i);
+	CHECK(f == 1U && i == 47120U, "the old order, for the no-carry case, is as expected");
+	expect_eqd(FRAME_BITS + 10000U, f, i, "no carry, one frame");
+	old_split(1000U, &f, &i);
+	expect_eqd(1000U, f, i, "no carry, no whole frame");
+	old_split(2U * FRAME_BITS + NO_CARRY_LIMIT - 1U, &f, &i);
+	expect_eqd(2U * FRAME_BITS + NO_CARRY_LIMIT - 1U, f, i, "no carry, last remainder below the limit");
+
+	/* Carry: the remainder is 118400 or more, so remainder + DELAY_HI term
+	 * reaches a whole frame. Old: FRAMES 0, INFRAME 157120 (above a frame).
+	 * Now: FRAMES 1, INFRAME 1600.
+	 */
+	old_split(120000U, &f, &i);
+	CHECK(f == 0U && i == 157120U, "the old order, for the carry case, left INFRAME above a frame");
+	expect_eqd(120000U, 1U, 1600U, "carry from zero frames");
+	expect_eqd(NO_CARRY_LIMIT, 1U, 0U, "carry, remainder exactly at the limit");
+	expect_eqd(FRAME_BITS + 150000U, 2U, 31600U, "carry with one whole frame already");
+	expect_eqd(2U * FRAME_BITS + 118500U, 3U, 100U, "carry with two whole frames");
+
+	/* INFRAME is always below one frame now. */
+	CHECK(ODI_GPON_USF_EQ_DELAY_EQD_GET(eq_delay_reg()) < FRAME_BITS, "INFRAME stays below one frame");
+}
+
+static void set_upstream_overhead(uint16_t preassigned_delay)
+{
+	static const uint8_t delim[3] = { 0xb5, 0x98, 0x30 };
+
+	odi_gpon_hw_ops()->set_upstream_overhead(NULL, 8U, 4U, 4U, 0x55U, delim, preassigned_delay, 0U);
+}
+
+static void test_preassigned_delay(void)
+{
+	setup();
+
+	/* No pre-assigned delay: only the DELAY_HI term, as the capture shows. */
+	set_upstream_overhead(0U);
+	CHECK(eq_delay_reg() == 0x9100U, "no pre-assigned delay: USF_EQ_DELAY is the DELAY_HI term alone");
+
+	/* 16 units of 32 bytes = 4096 bits. */
+	set_upstream_overhead(16U);
+	CHECK(ODI_GPON_USF_EQ_DELAY_FRAMES_GET(eq_delay_reg()) == 0U, "pre-assigned 16: FRAMES");
+	CHECK(ODI_GPON_USF_EQ_DELAY_EQD_GET(eq_delay_reg()) == 4096U + DELAY_HI_BITS, "pre-assigned 16: INFRAME");
+
+	/* 600 units = 153600 bits: goes through the same split, with a carry. */
+	set_upstream_overhead(600U);
+	CHECK(ODI_GPON_USF_EQ_DELAY_FRAMES_GET(eq_delay_reg()) == 1U, "pre-assigned 600: FRAMES carries");
+	CHECK(ODI_GPON_USF_EQ_DELAY_EQD_GET(eq_delay_reg()) == 153600U + DELAY_HI_BITS - FRAME_BITS,
+	      "pre-assigned 600: INFRAME");
+}
+
+static uint32_t boh_length(void)
+{
+	return ODI_GPON_USF_BURST_HDR_SETUP_LENGTH_GET(
+		odi_mock.regs[odi_mock_slot(ODI_GPON_USF_BURST_HDR_SETUP_OFF)]);
+}
+
+/* USF_BURST_HDR_SETUP.LENGTH = the fixed guard/delimiter bytes plus the
+ * Extended_Burst_Length count. Guard 32 bits, no type 1/2 preamble: 7
+ * fixed bytes. ISP2's pre-ranged count 50 gives the captured 0x39; counts
+ * past the old 63-byte clamp must reach the 8-bit field, up to 252.
+ */
+static void test_burst_overhead_length(void)
+{
+	static const uint8_t delim[3] = { 0xab, 0x59, 0x83 };
+
+	setup();
+	odi_gpon_hw_ops()->set_upstream_overhead(NULL, 32U, 0U, 0U, 0xaaU, delim, 0U, 0U);
+	CHECK(boh_length() == 0x0cU, "before Extended_Burst_Length: 0x0c");
+	odi_gpon_hw_ext_burst_length(50U, 18U);
+	CHECK(boh_length() == 0x39U, "pre-ranged 50: the captured 0x39");
+	odi_gpon_hw_ext_burst_length(100U, 18U);
+	CHECK(boh_length() == 107U, "pre-ranged 100: 107, no longer cut to 63");
+	odi_gpon_hw_ext_burst_length(250U, 18U);
+	CHECK(boh_length() == 128U, "pre-ranged 250: cut at 128 in all (G.984.3 9.2.3.20)");
+
+	/* Ranged: the ranged count, kept for after O5, must not wrap past 255. */
+	odi_gpon_hw_eqd_rewrite(227172U);
+	odi_gpon_hw.eqd_applied = 1;
+	odi_gpon_hw_ext_burst_length(250U, 250U);
+	CHECK(boh_length() == 128U, "ranged 250: cut at 128, not wrapped to 1");
+	odi_gpon_hw_ext_burst_length(41U, 18U);
+	CHECK(boh_length() == 25U, "ranged 18: 25 = 0x19, as captured");
+}
+
+/* A Ranging_Time reaches odi_gpon_isr_poll() through the PLOAM RX FIFO. */
+static void feed_ranging(struct odi_gpon_fsm *fsm, uint8_t onu_id, uint8_t protection, uint32_t eqd)
+{
+	uint16_t words[6];
+	struct odi_gpon_ploam msg;
+	unsigned int i;
+
+	memset(&msg, 0, sizeof msg);
+	msg.onu_id = onu_id;
+	msg.type = ODI_GPON_DS_RANGING_TIME;
+	msg.content[0] = protection;
+	msg.content[1] = (uint8_t)(eqd >> 24);
+	msg.content[2] = (uint8_t)(eqd >> 16);
+	msg.content[3] = (uint8_t)(eqd >> 8);
+	msg.content[4] = (uint8_t)eqd;
+	odi_gpon_ploam_pack_words(&msg, words);
+
+	odi_mock.regs[odi_mock_slot(ODI_GPON_PONMAC_IRQ_PENDING_OFF)] = ODI_GPON_PONMAC_IRQ_PENDING_DS_FRAMER;
+	odi_mock.regs[odi_mock_slot(ODI_GPON_DSF_IRQ_EVENT_OFF)] = ODI_GPON_DSF_IRQ_EVENT_PLOAM_RX;
+	odi_mock.regs[odi_mock_slot(ODI_GPON_DSF_PLOAM_RX_CTL_OFF)] = 0U;
+	for (i = 0; i < 6U; i++)
+		odi_mock.regs[odi_mock_slot(ODI_GPON_DSF_PLOAM_RX_WORD(i))] = words[i];
+	(void)odi_gpon_isr_poll(fsm, NULL);
+}
+
+static void test_protection_path_ignored(void)
+{
+	struct odi_gpon_fsm fsm;
+	unsigned int n_before, i;
+	int eqd_writes = 0;
+
+	setup();
+	odi_gpon_fsm_init(&fsm);
+	fsm.state = ODI_GPON_STATE_O5;
+	fsm.onu_id = 0x1aU;
+
+	/* O5, the second and third read of a main path message: rewritten. */
+	feed_ranging(&fsm, 0x1aU, 0U, 227172U);
+	CHECK(eq_delay_reg() == ((1U << 24) | 108772U), "O5: a main path Ranging_Time rewrites USF_EQ_DELAY");
+
+	/* The protection path message must not touch it. */
+	n_before = odi_mock.log_n;
+	feed_ranging(&fsm, 0x1aU, 1U, 120000U);
+	CHECK(eq_delay_reg() == ((1U << 24) | 108772U), "O5: a protection path Ranging_Time leaves USF_EQ_DELAY alone");
+	for (i = n_before; i < odi_mock.log_n; i++)
+		if (odi_mock.log[i].addr == ODI_GPON_USF_EQ_DELAY_OFF)
+			eqd_writes++;
+	CHECK(eqd_writes == 0, "O5: a protection path Ranging_Time writes no USF_EQ_DELAY at all");
+}
+
+/* A broadcast POPUP takes an ONU from O6 back to O4 to be ranged again
+ * (G.984.3 clause 10.2.2 f), Table 10-1). In O4 the ONU answers a ranging
+ * request after its minimum response time plus the pre-assigned delay
+ * (Table 10-1, the ranging request row; clause 10.2.5.2 b)), with the
+ * pre-ranged burst overhead, as in its first O4: the equalization delay of
+ * the old ranging and the ranged burst length must go, or the ranging
+ * burst lands where the OLT does not look for it. Driven through the FSM
+ * with the register leaves, so what is checked is the registers.
+ */
+static void feed_fsm(struct odi_gpon_fsm *fsm, struct odi_gpon_ploam *msg)
+{
+	odi_gpon_fsm_handle_event(fsm, odi_gpon_hw_ops(), NULL, ODI_GPON_EVENT_PLOAM_RX, msg);
+}
+
+static void test_broadcast_popup_restores_preranged(void)
+{
+	static const uint8_t sn[8] = { 'O', 'D', 'I', 'S', 1, 2, 3, 4 };
+	struct odi_gpon_fsm fsm;
+	struct odi_gpon_ploam msg;
+
+	setup();
+	odi_gpon_fsm_init(&fsm);
+	odi_gpon_fsm_set_serial_number(&fsm, sn);
+	fsm.state = ODI_GPON_STATE_O2;
+
+	/* Upstream_Overhead: guard 32 bits, no type 1/2 preamble (7 fixed
+	 * bytes), pre-assigned delay enabled, 16 units of 32 bytes.
+	 */
+	memset(&msg, 0, sizeof msg);
+	msg.onu_id = ODI_GPON_ONU_ID_BROADCAST;
+	msg.type = ODI_GPON_DS_UPSTREAM_OVERHEAD;
+	msg.content[0] = 32U;
+	msg.content[3] = 0xaaU;
+	msg.content[4] = 0xabU;
+	msg.content[5] = 0x59U;
+	msg.content[6] = 0x83U;
+	msg.content[7] = 0x20U;	/* e = 1 */
+	msg.content[9] = 16U;
+	feed_fsm(&fsm, &msg);
+	CHECK(fsm.state == ODI_GPON_STATE_O3, "Upstream_Overhead: O3");
+	odi_gpon_hw_ext_burst_length(50U, 18U);
+	CHECK(boh_length() == 0x39U, "pre-ranged burst: 7 + 50");
+	CHECK(eq_delay_reg() == 4096U + DELAY_HI_BITS, "pre-ranged EqD: 4096 bits pre-assigned");
+
+	/* Assigned and ranged (the ONU-ID write is not under test here). */
+	fsm.state = ODI_GPON_STATE_O4;
+	fsm.onu_id = 0x1aU;
+	memset(&msg, 0, sizeof msg);
+	msg.onu_id = 0x1aU;
+	msg.type = ODI_GPON_DS_RANGING_TIME;
+	msg.content[2] = 0x03U;	/* 227172 bits = 0x00037764 */
+	msg.content[3] = 0x77U;
+	msg.content[4] = 0x64U;
+	feed_fsm(&fsm, &msg);
+	CHECK(fsm.state == ODI_GPON_STATE_O5, "Ranging_Time: O5");
+	CHECK(boh_length() == 25U, "ranged burst: 7 + 18");
+	CHECK(eq_delay_reg() == ((1U << 24) | 108772U), "ranged EqD");
+
+	/* Loss in O5, then the OLT's broadcast POPUP. */
+	odi_gpon_fsm_handle_event(&fsm, odi_gpon_hw_ops(), NULL, ODI_GPON_EVENT_LOS, NULL);
+	CHECK(fsm.state == ODI_GPON_STATE_O6, "LOS: O6");
+	memset(&msg, 0, sizeof msg);
+	msg.onu_id = ODI_GPON_ONU_ID_BROADCAST;
+	msg.type = ODI_GPON_DS_POPUP;
+	feed_fsm(&fsm, &msg);
+	CHECK(fsm.state == ODI_GPON_STATE_O4, "broadcast POPUP: O4");
+	CHECK(boh_length() == 0x39U, "broadcast POPUP: the pre-ranged burst length again");
+	CHECK(eq_delay_reg() == 4096U + DELAY_HI_BITS, "broadcast POPUP: the pre-assigned EqD again");
+
+	/* An Extended_Burst_Length in this O4 sets the pre-ranged length. */
+	odi_gpon_hw_ext_burst_length(41U, 18U);
+	CHECK(boh_length() == 48U, "O4 after POPUP: Extended_Burst_Length sets the pre-ranged length");
+
+	/* Ranged again: the ranged length and the new EqD. */
+	msg.onu_id = 0x1aU;
+	msg.type = ODI_GPON_DS_RANGING_TIME;
+	msg.content[2] = 0x03U;
+	msg.content[3] = 0x77U;
+	msg.content[4] = 0x64U;
+	feed_fsm(&fsm, &msg);
+	CHECK(fsm.state == ODI_GPON_STATE_O5, "Ranging_Time after POPUP: O5");
+	CHECK(boh_length() == 25U, "ranged again: 7 + 18");
+	CHECK(eq_delay_reg() == ((1U << 24) | 108772U), "ranged again: the new EqD");
+
+	/* A directed POPUP keeps everything O5 had. */
+	odi_gpon_fsm_handle_event(&fsm, odi_gpon_hw_ops(), NULL, ODI_GPON_EVENT_LOS, NULL);
+	memset(&msg, 0, sizeof msg);
+	msg.onu_id = 0x1aU;
+	msg.type = ODI_GPON_DS_POPUP;
+	feed_fsm(&fsm, &msg);
+	CHECK(fsm.state == ODI_GPON_STATE_O5, "directed POPUP: O5");
+	CHECK(boh_length() == 25U, "directed POPUP: the ranged burst stays");
+	CHECK(eq_delay_reg() == ((1U << 24) | 108772U), "directed POPUP: the EqD stays");
+}
+
+/* An OLT that sends no Extended_Burst_Length: the burst overhead is the
+ * 12-byte default before and after ranging (G.984.3 9.2.3.20, the stock
+ * GPON module), not another OLT's ranged count.
+ */
+static void test_no_extended_burst_length(void)
+{
+	static const uint8_t sn[8] = { 'O', 'D', 'I', 'S', 1, 2, 3, 4 };
+	struct odi_gpon_fsm fsm;
+	struct odi_gpon_ploam msg;
+
+	setup();
+	odi_gpon_fsm_init(&fsm);
+	odi_gpon_fsm_set_serial_number(&fsm, sn);
+	fsm.state = ODI_GPON_STATE_O2;
+	memset(&msg, 0, sizeof msg);
+	msg.onu_id = ODI_GPON_ONU_ID_BROADCAST;
+	msg.type = ODI_GPON_DS_UPSTREAM_OVERHEAD;
+	msg.content[0] = 32U;
+	msg.content[3] = 0xaaU;
+	msg.content[4] = 0xabU;
+	msg.content[5] = 0x59U;
+	msg.content[6] = 0x83U;
+	feed_fsm(&fsm, &msg);
+	CHECK(boh_length() == 0x0cU, "no Extended_Burst_Length, pre-ranged: 12");
+	fsm.state = ODI_GPON_STATE_O4;
+	fsm.onu_id = 0x1aU;
+	memset(&msg, 0, sizeof msg);
+	msg.onu_id = 0x1aU;
+	msg.type = ODI_GPON_DS_RANGING_TIME;
+	msg.content[2] = 0x03U;
+	msg.content[3] = 0x77U;
+	msg.content[4] = 0x64U;
+	feed_fsm(&fsm, &msg);
+	CHECK(fsm.state == ODI_GPON_STATE_O5, "Ranging_Time: O5");
+	CHECK(boh_length() == 0x0cU, "no Extended_Burst_Length, ranged: still 12");
+}
+
+int main(void)
+{
+	test_split();
+	test_preassigned_delay();
+	test_protection_path_ignored();
+	test_burst_overhead_length();
+	test_broadcast_popup_restores_preranged();
+	test_no_extended_burst_length();
+
+	if (failures) {
+		fprintf(stderr, "%d check(s) failed\n", failures);
+		return 1;
+	}
+	printf("odi_gpon_eqd_test: all checks passed\n");
+	return 0;
+}

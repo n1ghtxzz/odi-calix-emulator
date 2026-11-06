@@ -1,0 +1,69 @@
+# busybox init. Four kinds of entry, and the order among the KINDS matters
+# more than the order within this file: init runs every sysinit entry to
+# completion, in file order, before starting anything else; then every wait
+# entry, each to completion; then fires every once entry without waiting for
+# it; and only then starts (and, forever after, restarts on exit) every
+# respawn entry. docs/BOOT.md has the full reasoning.
+#
+# sysinit: rcS. Mounts, the config partition, the management address, the
+# switch SDK-init verbs -- everything the respawn entries below need already
+# in place. Nothing starts until this returns, so anything that blocks here
+# costs every way back into the device at once.
+::sysinit:/etc/init.d/rcS
+
+# once: rcS.pon, the PON steps (docs/BOOT.md, "The PON steps"). Runs
+# concurrently with the respawn entries below coming up -- it does not wait
+# for them, and only one step (gponact) waits, bounded, for omcid.
+::once:/etc/init.d/rcS.pon
+
+# once: slot-state.sh. Records which slot is running and whether sw_commit
+# (in both environment copies) names it, into /var/run/odi-slot for the
+# exporter and the web UI, and into /var/run/motd (/etc/motd) for ssh
+# logins. Reads only; bounded; exits (docs/FLASHING.md, "Committing").
+::once:/etc/scripts/slot-state.sh
+
+# once: trial-guard.sh. On a trial boot only (not committed, the next boot
+# goes to another slot), registers an odi_wdt client that resets the board
+# 300 s later unless the management path is seen working both ways first,
+# so a trial that boots but cannot be reached goes back to the committed
+# slot by itself. Reads the state slot-state.sh writes; bounded; exits
+# (docs/FLASHING.md, "The trial guard").
+::once:/etc/scripts/trial-guard.sh
+
+# No telnet: ssh (dropbear) is the only network login. The trial boot and
+# its self-revert are the way back if ssh ever fails to come up.
+# askfirst, not respawn: login gives up after 60 s at its prompt, so a
+# respawned login on a console nobody uses exited and restarted every
+# minute, two syslog lines each time, enough on their own to cycle the
+# 64 KB ring in a few hours. askfirst waits for Enter, with no timeout, and
+# only then runs login.
+ttyS0::askfirst:/bin/login -p
+
+# syslogd, klogd, ntpd, metricsd, confd, dropbear, omcid: each restarted the
+# instant it exits, forever, by init itself -- no supervise.sh, no restart
+# budget, no rate limit (docs/SETTINGS.md, "native over hand-rolled"). Every
+# entry is a script, not the daemon directly: each checks its own
+# /etc/config/<name>.off flag first (rootfs/skeleton/etc/scripts/svc-*.sh)
+# and sets its oom_score_adj right before exec-ing the daemon in place
+# (rootfs/skeleton/etc/scripts/respawn.sh), so the pid init tracks is always
+# the daemon itself, never a parent that already exited.
+#
+# igmpd is opt-in (IGMP_SNOOPING=1, scripts/svc-igmpd.sh): off, the entry
+# parks in respawn-off.sh and the switch floods multicast as before.
+#
+# syslogd/klogd/ntpd are new vs. the stock image, which has neither a
+# syslog daemon nor an NTP client. ntpd's own script gates on NTP_SERVER being set in the config
+# store (docs/SETTINGS.md); this entry is always here, static like every
+# other inittab line, and does nothing until that key is set.
+::respawn:/etc/scripts/svc-syslogd.sh
+::respawn:/etc/scripts/svc-klogd.sh
+::respawn:/etc/scripts/svc-ntpd.sh
+::respawn:/etc/scripts/svc-metricsd.sh
+::respawn:/etc/scripts/svc-confd.sh
+::respawn:/etc/scripts/svc-dropbear.sh
+::respawn:/etc/scripts/svc-omcid.sh
+::respawn:/etc/scripts/svc-igmpd.sh
+
+::restart:/sbin/init
+::ctrlaltdel:/sbin/reboot
+::shutdown:/bin/umount -a -r
