@@ -35,3 +35,4 @@ root-password*.txt
 *.key
 node_modules/
 test/web/results/
+/debug.log
