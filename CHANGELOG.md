@@ -5,6 +5,10 @@ listed here.
 
 ## Unreleased
 
+**Automated dependency bump.**
+- linux 6.18.58 -> 6.18.65
+
+
 - Synchronize English and Russian README structure, comparison rows, build commands, release/profile links and validation/limitations; distinguish the public generic image from the private owner image in both languages.
 
 - Add a blank Calix/E7 profile template, validated offline seed/OME1 generator, RU/EN setup guides and an append-only v1.0.0 release asset job. Existing subscriber values are omitted unless explicitly supplied; the firmware image is unchanged.
